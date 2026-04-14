@@ -1,0 +1,812 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Rules Browser</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+       background: #f0f0f5; color: #1a1a2e; height: 100vh; overflow: hidden; }
+
+/* ── Splash ─────────────────────────────────────────────────────────────── */
+.splash { display: flex; align-items: center; justify-content: center;
+          height: 100vh; background: #0f0f22; }
+.splash-card { background: #1a1a2e; border-radius: 16px; padding: 40px 48px;
+               max-width: 540px; width: 100%; box-shadow: 0 8px 32px rgba(0,0,0,0.4); }
+.splash-card h1 { color: #fff; font-size: 22px; margin-bottom: 8px; }
+.splash-card p  { color: #7070a0; font-size: 14px; margin-bottom: 28px; line-height: 1.6; }
+.file-slots { display: flex; flex-direction: column; gap: 10px; margin-bottom: 24px; }
+.file-slot { display: flex; align-items: center; gap: 12px; padding: 12px 14px;
+             border-radius: 8px; border: 1.5px solid #2a2a4a; }
+.file-slot.loaded { border-color: #22c55e; }
+.file-slot.failed { border-color: #4a2a2a; }
+.file-slot.loading { border-color: #2a2a4a; }
+.slot-icon { font-size: 18px; width: 24px; text-align: center; color: #4a4a6a; }
+.file-slot.loaded .slot-icon { color: #22c55e; }
+.file-slot.failed .slot-icon { color: #6a3a3a; }
+.slot-info { flex: 1; }
+.slot-name { font-size: 13px; color: #c0c0e0; font-weight: 500; }
+.slot-desc { font-size: 11px; color: #5a5a7a; margin-top: 2px; }
+.slot-action { font-size: 12px; color: #6060a0; }
+.file-slot.loaded .slot-action { color: #22c55e; }
+.file-slot.failed .slot-action { color: #7a4a4a; }
+.splash-note { font-size: 11px; color: #4a4a6a; text-align: center; margin-top: 16px; }
+
+/* ── App layout ──────────────────────────────────────────────────────────── */
+.layout { display: flex; height: 100vh; }
+.sidebar { width: 240px; background: #1a1a2e; color: #c8c8e0; display: flex;
+           flex-direction: column; flex-shrink: 0; overflow: hidden; }
+.sidebar h1 { font-size: 14px; font-weight: 700; color: #fff; letter-spacing: 0.5px;
+              padding: 16px; border-bottom: 1px solid #2a2a4a; flex-shrink: 0; }
+.sidebar-inner { padding: 12px 16px 16px; overflow-y: auto; flex: 1; }
+.main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+.main-header { padding: 14px 20px; background: white; border-bottom: 1px solid #e0e0e8;
+               display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; }
+.main-scroll { flex: 1; overflow-y: auto; padding: 16px 20px; }
+
+/* ── Sidebar elements ────────────────────────────────────────────────────── */
+.section-label { font-size: 10px; text-transform: uppercase; letter-spacing: 1.2px;
+                 color: #5a5a7a; margin-bottom: 6px; margin-top: 14px; }
+.db-list, .cat-list { display: flex; flex-direction: column; gap: 2px; }
+.db-btn, .cat-btn { display: flex; justify-content: space-between; align-items: center;
+                    padding: 6px 10px; border-radius: 6px; border: none; background: transparent;
+                    color: #9090b0; cursor: pointer; font-size: 13px; width: 100%; text-align: left; }
+.db-btn:hover, .cat-btn:hover { background: #252545; color: #d0d0f0; }
+.db-btn.active, .cat-btn.active { background: #252545; color: #fff; }
+.db-count { font-size: 11px; color: #6060a0; }
+.db-btn.active .db-count { color: #9090c0; }
+.cat-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 7px; }
+.search-input { width: 100%; padding: 8px 10px; border-radius: 7px; border: 1px solid #2a2a4a;
+                background: #0f0f22; color: #e0e0f0; font-size: 13px; margin-top: 4px; }
+.search-input:focus { outline: none; border-color: #5050a0; }
+.search-input::placeholder { color: #4a4a6a; }
+.progress-bar { height: 4px; background: #252545; border-radius: 2px; overflow: hidden; }
+.progress-fill { height: 100%; background: linear-gradient(90deg,#22c55e,#6366f1);
+                 border-radius: 2px; transition: width 0.4s; }
+.progress-label { font-size: 11px; color: #5a5a7a; margin-top: 5px; text-align: right; }
+.stat-rows { margin-top: 8px; }
+.stat-row { display: flex; justify-content: space-between; font-size: 12px; color: #7070a0; padding: 2px 0; }
+.open-more-btn { display: block; width: 100%; margin-top: 16px; padding: 7px;
+                 border-radius: 6px; border: 1px dashed #2a2a4a; background: transparent;
+                 color: #6060a0; font-size: 12px; cursor: pointer; text-align: center; }
+.open-more-btn:hover { border-color: #6366f1; color: #9090f0; }
+.loaded-file { font-size: 11px; color: #4a4a6a; padding: 3px 0; display: flex;
+               align-items: center; gap: 6px; }
+.loaded-file .dot { width: 6px; height: 6px; border-radius: 50%; background: #22c55e; }
+
+/* ── Cards ───────────────────────────────────────────────────────────────── */
+.total-info { font-size: 13px; color: #666; }
+.kbd-hint { font-size: 11px; color: #aaa; background: #f5f5f5; border: 1px solid #ddd;
+            border-radius: 4px; padding: 2px 6px; }
+.rules-list { display: flex; flex-direction: column; gap: 10px;
+              max-width: 820px; margin: 0 auto; }
+.rule-card { background: white; border-radius: 10px; padding: 16px 18px;
+             box-shadow: 0 1px 3px rgba(0,0,0,.07); border-left: 4px solid #e0e0e8;
+             transition: border-color 0.15s; outline: none; }
+.rule-card:focus { box-shadow: 0 0 0 2px #6366f1; }
+.rule-card.cat-deterministic { border-left-color: #22c55e; }
+.rule-card.cat-llm   { border-left-color: #6366f1; }
+.rule-card.cat-mixed { border-left-color: #f59e0b; }
+.rule-text { font-size: 14px; line-height: 1.65; white-space: pre-wrap; word-break: break-word;
+             margin-bottom: 10px; color: #1a1a2e; max-height: 160px; overflow: hidden;
+             position: relative; }
+.rule-text.expanded { max-height: none; }
+.rule-text:not(.expanded)::after { content: ''; position: absolute; bottom: 0; left: 0; right: 0;
+                                    height: 40px; background: linear-gradient(transparent,white); }
+.expand-btn { font-size: 11px; color: #6366f1; cursor: pointer; border: none;
+              background: none; padding: 0; margin-bottom: 8px; display: block; }
+.rule-meta { font-size: 11px; color: #999; margin-bottom: 10px;
+             display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.rule-meta a { color: #6366f1; text-decoration: none; }
+.rule-meta a:hover { text-decoration: underline; }
+.tag { background: #f0f0f8; padding: 2px 7px; border-radius: 4px; font-size: 10px; color: #7070a0; }
+.tag.source { background: #f0f4ff; color: #4455aa; }
+.rule-actions { display: flex; gap: 7px; flex-wrap: wrap; align-items: center; }
+.action-btn { padding: 4px 13px; border-radius: 20px; border: 1.5px solid; cursor: pointer;
+              font-size: 12px; font-weight: 500; background: transparent; transition: all .1s; }
+.action-btn.det { border-color:#22c55e; color:#22c55e; }
+.action-btn.det:hover, .action-btn.det.active { background:#22c55e; color:white; }
+.action-btn.mix { border-color:#f59e0b; color:#f59e0b; }
+.action-btn.mix:hover, .action-btn.mix.active { background:#f59e0b; color:white; }
+.action-btn.llm { border-color:#6366f1; color:#6366f1; }
+.action-btn.llm:hover, .action-btn.llm.active { background:#6366f1; color:white; }
+.action-btn.clr { border-color:#ccc; color:#aaa; font-size:11px; padding:3px 10px; }
+.action-btn.clr:hover { border-color:#999; color:#666; }
+.mech-select { padding:4px 8px; border-radius:6px; border:1px solid #e0e0e8;
+               font-size:12px; color:#666; background:white; }
+.load-more { text-align:center; padding:24px 0; }
+.load-more-btn { padding:9px 28px; border-radius:8px; border:1.5px solid #6366f1;
+                 color:#6366f1; background:transparent; cursor:pointer; font-size:14px; }
+.load-more-btn:hover { background:#6366f1; color:white; }
+.empty { text-align:center; color:#aaa; padding:60px 20px; font-size:15px; }
+.saving-indicator { font-size:11px; color:#22c55e; margin-left:8px; opacity:0; transition:opacity .3s; }
+.saving-indicator.show { opacity:1; }
+.download-btn { font-size:12px; padding:4px 12px; border-radius:6px; border:1px solid #22c55e;
+                color:#22c55e; background:transparent; cursor:pointer; margin-left:8px; }
+.download-btn:hover { background:#22c55e; color:#fff; }
+.download-btn.pending { border-color:#f59e0b; color:#f59e0b; }
+.download-btn.pending:hover { background:#f59e0b; color:#fff; }
+.error-banner { background:#fee; border:1px solid #fcc; padding:10px 14px; border-radius:8px;
+                font-size:13px; color:#c00; margin-bottom:12px; }
+</style>
+</head>
+<body>
+
+<!-- ── Splash screen ──────────────────────────────────────────────────────── -->
+<div id="splash" class="splash">
+  <div class="splash-card">
+    <h1>Rules Browser</h1>
+    <p>Loading database files…</p>
+    <div class="file-slots" id="fileSlots"></div>
+    <p class="splash-note" id="splashError" style="color:#f66;display:none"></p>
+  </div>
+</div>
+
+<!-- ── Main app ───────────────────────────────────────────────────────────── -->
+<div id="app" class="layout" style="display:none">
+  <div class="sidebar">
+    <h1>Rules Browser
+      <span id="savingIndicator" class="saving-indicator">saved</span>
+      <button id="downloadBtn" class="download-btn" title="Download modified processed.db">↓ Download</button>
+    </h1>
+    <div class="sidebar-inner">
+      <div class="section-label">Database</div>
+      <div id="dbList" class="db-list"></div>
+
+      <div class="section-label">Filter</div>
+      <input id="searchInput" class="search-input" placeholder="Search rules…" autocomplete="off">
+      <div id="catList" class="cat-list" style="margin-top:8px"></div>
+
+      <div class="section-label" style="margin-top:14px">Source</div>
+      <div id="sourceList" class="cat-list"></div>
+
+      <div class="section-label">Progress</div>
+      <div class="progress-bar"><div id="progressFill" class="progress-fill" style="width:0%"></div></div>
+      <div id="progressLabel" class="progress-label">—</div>
+      <div id="statRows" class="stat-rows"></div>
+
+      <button id="openMoreBtn" class="open-more-btn">+ Open another DB file</button>
+      <div id="loadedFiles"></div>
+    </div>
+  </div>
+
+  <div class="main">
+    <div class="main-header">
+      <span id="totalInfo" class="total-info">Loading…</span>
+      <span class="kbd-hint">D · M · L to categorize · ↑↓ to navigate</span>
+    </div>
+    <div class="main-scroll" id="mainScroll">
+      <div id="rulesList" class="rules-list"></div>
+      <div id="loadMoreDiv" class="load-more" style="display:none">
+        <button id="loadMoreBtn" class="load-more-btn">Load more</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+import * as duckdb from 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/+esm';
+
+// ── Constants ─────────────────────────────────────────────────────────────
+
+const MECHANISMS = ['','linter','formatter','type-checker','git-hook','ci-gate',
+                    'gitignore','regex','filesystem','db-constraint','shell-script','other'];
+const PAGE = 30;
+
+const DB_SLOTS = [
+  { key: 'processed', file: 'processed.db', desc: 'Categorized rules', required: true },
+  { key: 'rules',     file: 'rules.db',     desc: 'Source DB 1',      required: false },
+  { key: 'rules2',    file: 'rules2.db',    desc: 'Source DB 2',      required: false },
+  { key: 'rules3',    file: 'rules3.db',    desc: 'Source DB 3',      required: false },
+];
+
+// ── State ─────────────────────────────────────────────────────────────────
+
+const S = {
+  db: null, conn: null,
+  loaded: new Set(),  // which slot keys are loaded
+  dirty: false,       // unsaved changes to processed_rules
+  tab: '_all',        // current tab key
+  tabs: [],           // [{key, label, mode, total, det, llm, mix, unc}]
+  category: 'all', source: '', search: '',
+  offset: 0, total: 0, loading: false, mode: 'processed',
+  focusedCard: null,
+};
+
+// ── DuckDB init ───────────────────────────────────────────────────────────
+
+async function initDuckDB() {
+  const bundles = duckdb.getJsDelivrBundles();
+  const bundle  = await duckdb.selectBundle(bundles);
+  const workerUrl = URL.createObjectURL(
+    new Blob([`importScripts("${bundle.mainWorker}")`], { type: 'text/javascript' })
+  );
+  const worker = new Worker(workerUrl);
+  const db = new duckdb.AsyncDuckDB(new duckdb.ConsoleLogger(duckdb.LogLevel.WARNING), worker);
+  await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
+  return db;
+}
+
+// ── File loading ──────────────────────────────────────────────────────────
+
+async function fetchDbFile(key, url) {
+  const resp = await fetch(url);
+  if (!resp.ok) return false;
+  const buffer = new Uint8Array(await resp.arrayBuffer());
+  await S.db.registerFileBuffer(`${key}.db`, buffer);
+  return true;
+}
+
+async function attachDb(key) {
+  const fname  = `${key}.db`;
+  const schema = key; // use key as schema name
+  try {
+    if (key === 'processed') {
+      await S.conn.query(`ATTACH '${fname}' AS proc`);
+      // Ensure schema exists
+      await S.conn.query(`
+        CREATE TABLE IF NOT EXISTS proc.processed_rules (
+          id VARCHAR PRIMARY KEY,
+          source_db VARCHAR NOT NULL,
+          source_id VARCHAR NOT NULL,
+          source_url VARCHAR,
+          repo_name VARCHAR,
+          rule_source VARCHAR,
+          rule_text TEXT NOT NULL,
+          rule_index INTEGER,
+          enforcement_category VARCHAR,
+          enforcement_mechanism VARCHAR,
+          enforcement_notes TEXT,
+          processed_at TIMESTAMP
+        )
+      `);
+    } else {
+      await S.conn.query(`ATTACH '${fname}' AS ${schema} (READ_ONLY)`);
+    }
+  } catch (e) {
+    console.warn(`ATTACH ${key} failed:`, e.message);
+    throw e;
+  }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────
+
+function esc(s) {
+  return s == null ? '' : String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;');
+}
+
+function sqlStr(s) {
+  // Safe string literal for trusted internal values (no user-injected SQL)
+  return s == null ? 'NULL' : `'${String(s).replace(/'/g,"''")}'`;
+}
+
+async function rows(sql) {
+  const result = await S.conn.query(sql);
+  const fields = result.schema.fields.map(f => f.name);
+  const out = [];
+  for (const batch of result.batches) {
+    for (let i = 0; i < batch.numRows; i++) {
+      const row = {};
+      fields.forEach((name, j) => {
+        let v = batch.getChildAt(j).get(i);
+        if (typeof v === 'bigint') v = Number(v);
+        row[name] = v;
+      });
+      out.push(row);
+    }
+  }
+  return out;
+}
+
+async function scalar(sql) {
+  const r = await rows(sql);
+  return r[0] ? Object.values(r[0])[0] : 0;
+}
+
+// ── Download processed.db ─────────────────────────────────────────────────
+
+async function downloadDb() {
+  try {
+    await S.conn.query('CHECKPOINT proc');
+    const buf  = await S.db.copyFileToBuffer('processed.db');
+    const blob = new Blob([buf], { type: 'application/octet-stream' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href = url; a.download = 'processed.db'; a.click();
+    URL.revokeObjectURL(url);
+    setDirty(false);
+    flashSaved();
+  } catch (e) {
+    console.error('Download failed:', e);
+  }
+}
+
+function setDirty(dirty) {
+  S.dirty = dirty;
+  const btn = document.getElementById('downloadBtn');
+  if (btn) btn.classList.toggle('pending', dirty);
+}
+
+function flashSaved() {
+  const el = document.getElementById('savingIndicator');
+  el.classList.add('show');
+  setTimeout(() => el.classList.remove('show'), 1500);
+}
+
+// Mark dirty (called after each categorization instead of auto-saving)
+function markDirty() { setDirty(true); }
+
+// ── Tab / stats computation ───────────────────────────────────────────────
+
+async function computeTabs() {
+  const tabs = [];
+
+  if (S.loaded.has('processed')) {
+    // "All" tab + per-source-db tabs from processed
+    const sourceDbs = await rows(
+      `SELECT source_db, COUNT(*) AS n FROM proc.processed_rules GROUP BY 1 ORDER BY 2 DESC`
+    );
+    const total = await scalar('SELECT COUNT(*) FROM proc.processed_rules');
+    const det   = await scalar(`SELECT COUNT(*) FROM proc.processed_rules WHERE enforcement_category='deterministic'`);
+    const llm   = await scalar(`SELECT COUNT(*) FROM proc.processed_rules WHERE enforcement_category='llm'`);
+    const mix   = await scalar(`SELECT COUNT(*) FROM proc.processed_rules WHERE enforcement_category='mixed'`);
+    const unc   = total - det - llm - mix;
+    tabs.push({ key:'_all', label:'all (processed)', mode:'processed', total, det, llm, mix, unc });
+
+    for (const { source_db, n } of sourceDbs) {
+      const d = await scalar(`SELECT COUNT(*) FROM proc.processed_rules WHERE source_db=${sqlStr(source_db)} AND enforcement_category='deterministic'`);
+      const l = await scalar(`SELECT COUNT(*) FROM proc.processed_rules WHERE source_db=${sqlStr(source_db)} AND enforcement_category='llm'`);
+      const m = await scalar(`SELECT COUNT(*) FROM proc.processed_rules WHERE source_db=${sqlStr(source_db)} AND enforcement_category='mixed'`);
+      tabs.push({ key: source_db, label: source_db, mode:'processed',
+                  total: n, det: d, llm: l, mix: m, unc: n - d - l - m });
+    }
+  }
+
+  // Raw tabs for source DBs
+  for (const slot of DB_SLOTS.filter(s => s.key !== 'processed')) {
+    if (!S.loaded.has(slot.key)) continue;
+    const total = await scalar(`SELECT COUNT(*) FROM ${slot.key}.rules`);
+    tabs.push({ key: `raw:${slot.key}`, label: `${slot.key} (raw)`, mode:'raw',
+                total, det:0, llm:0, mix:0, unc: total });
+  }
+
+  S.tabs = tabs;
+}
+
+// ── Query functions ───────────────────────────────────────────────────────
+
+function buildWhere(extra = []) {
+  const w = [...extra];
+  if (S.tab.startsWith('raw:')) {
+    if (S.source) w.push(`source = ${sqlStr(S.source)}`);
+    if (S.search) w.push(`LOWER(content) LIKE ${sqlStr('%'+S.search.toLowerCase()+'%')}`);
+  } else {
+    if (S.tab !== '_all') w.push(`source_db = ${sqlStr(S.tab)}`);
+    if (S.source)         w.push(`rule_source = ${sqlStr(S.source)}`);
+    if (S.category === 'uncategorized') w.push(`enforcement_category IS NULL`);
+    else if (S.category !== 'all')      w.push(`enforcement_category = ${sqlStr(S.category)}`);
+    if (S.search) w.push(`LOWER(rule_text) LIKE ${sqlStr('%'+S.search.toLowerCase()+'%')}`);
+  }
+  return w.length ? 'WHERE ' + w.join(' AND ') : '';
+}
+
+async function fetchRules() {
+  const where = buildWhere();
+  if (S.tab.startsWith('raw:')) {
+    const schema = S.tab.slice(4);
+    S.total = await scalar(`SELECT COUNT(*) FROM ${schema}.rules ${where}`);
+    return rows(`
+      SELECT id, content AS rule_text, source_url, repo_name,
+             NULL AS enforcement_category, NULL AS enforcement_mechanism, NULL AS enforcement_notes,
+             NULL AS rule_index, NULL AS source_db, source AS rule_source, file_type, source AS source_label
+      FROM ${schema}.rules ${where}
+      ORDER BY content_len DESC NULLS LAST
+      LIMIT ${PAGE} OFFSET ${S.offset}
+    `);
+  } else {
+    S.total = await scalar(`SELECT COUNT(*) FROM proc.processed_rules ${where}`);
+    return rows(`
+      SELECT id, rule_text, source_url, repo_name,
+             enforcement_category, enforcement_mechanism, enforcement_notes,
+             rule_index, source_db, rule_source, NULL AS file_type, NULL AS source_label
+      FROM proc.processed_rules ${where}
+      ORDER BY source_db, rule_index ASC NULLS LAST, id
+      LIMIT ${PAGE} OFFSET ${S.offset}
+    `);
+  }
+}
+
+async function fetchSources() {
+  if (S.tab.startsWith('raw:')) {
+    const schema = S.tab.slice(4);
+    const w = buildWhere().replace(/source = '[^']*' AND ?/, '').replace(/AND ?source = '[^']*'/, '');
+    return rows(`SELECT source, COUNT(*) AS n FROM ${schema}.rules ${w} GROUP BY 1 ORDER BY 2 DESC`);
+  } else {
+    const parts = [];
+    if (S.tab !== '_all') parts.push(`source_db = ${sqlStr(S.tab)}`);
+    if (S.category === 'uncategorized') parts.push('enforcement_category IS NULL');
+    else if (S.category !== 'all') parts.push(`enforcement_category = ${sqlStr(S.category)}`);
+    if (S.search) parts.push(`LOWER(rule_text) LIKE ${sqlStr('%'+S.search.toLowerCase()+'%')}`);
+    const w = parts.length ? 'WHERE ' + parts.join(' AND ') : '';
+    return rows(`SELECT rule_source AS source, COUNT(*) AS n FROM proc.processed_rules ${w} GROUP BY 1 ORDER BY 2 DESC`);
+  }
+}
+
+// ── Render ────────────────────────────────────────────────────────────────
+
+function renderDbList() {
+  document.getElementById('dbList').innerHTML = S.tabs.map(t => `
+    <button class="db-btn ${t.key === S.tab ? 'active' : ''}" data-tab="${t.key}">
+      <span>${esc(t.label)}</span>
+      <span class="db-count">${t.total.toLocaleString()}</span>
+    </button>
+  `).join('');
+  document.querySelectorAll('.db-btn').forEach(btn =>
+    btn.addEventListener('click', () => selectTab(btn.dataset.tab))
+  );
+}
+
+function renderCatList() {
+  const t = S.tabs.find(x => x.key === S.tab) || {};
+  const cats = [
+    { key:'all',           label:'All',           color:'#9090c0', count: t.total },
+    { key:'uncategorized', label:'Uncategorized',  color:'#c0c0d0', count: t.unc },
+    { key:'deterministic', label:'Deterministic',  color:'#22c55e', count: t.det },
+    { key:'mixed',         label:'Mixed',          color:'#f59e0b', count: t.mix },
+    { key:'llm',           label:'LLM-only',       color:'#6366f1', count: t.llm },
+  ];
+  document.getElementById('catList').innerHTML = cats.map(c => `
+    <button class="cat-btn ${c.key === S.category ? 'active' : ''}" data-cat="${c.key}">
+      <span><span class="cat-dot" style="background:${c.color}"></span>${c.label}</span>
+      <span style="font-size:11px;color:#6060a0">${c.count != null ? c.count.toLocaleString() : ''}</span>
+    </button>
+  `).join('');
+  document.querySelectorAll('.cat-btn').forEach(btn =>
+    btn.addEventListener('click', () => selectCat(btn.dataset.cat))
+  );
+}
+
+function renderProgress() {
+  const t = S.tabs.find(x => x.key === S.tab) || {};
+  const total = t.total || 1;
+  const done  = (t.det || 0) + (t.mix || 0) + (t.llm || 0);
+  const pct   = Math.round(done / total * 100);
+  document.getElementById('progressFill').style.width  = pct + '%';
+  document.getElementById('progressLabel').textContent = `${done.toLocaleString()} / ${total.toLocaleString()} (${pct}%)`;
+  document.getElementById('statRows').innerHTML = [
+    ['Deterministic','#22c55e', t.det||0],
+    ['Mixed',        '#f59e0b', t.mix||0],
+    ['LLM-only',     '#6366f1', t.llm||0],
+    ['Uncategorized','#6060a0', t.unc||0],
+  ].map(([label,color,n]) => `
+    <div class="stat-row">
+      <span><span class="cat-dot" style="background:${color}"></span>${label}</span>
+      <span>${n.toLocaleString()}</span>
+    </div>`).join('');
+}
+
+async function renderSources() {
+  const data = await fetchSources();
+  const el   = document.getElementById('sourceList');
+  if (!data.length) { el.innerHTML = ''; return; }
+  el.innerHTML = [
+    `<button class="cat-btn ${S.source==='' ? 'active':''}" data-src="">
+       <span>All sources</span><span></span></button>`,
+    ...data.map(d => `
+      <button class="cat-btn ${S.source===d.source ? 'active':''}" data-src="${esc(d.source||'')}">
+        <span style="word-break:break-all">${esc(d.source||'(none)')}</span>
+        <span style="font-size:11px;color:#6060a0">${Number(d.n).toLocaleString()}</span>
+      </button>`)
+  ].join('');
+  el.querySelectorAll('.cat-btn').forEach(btn =>
+    btn.addEventListener('click', () => selectSource(btn.dataset.src))
+  );
+}
+
+function makeCard(rule) {
+  const processed = S.mode === 'processed';
+  const card = document.createElement('div');
+  card.className = 'rule-card' + (rule.enforcement_category ? ' cat-' + rule.enforcement_category : '');
+  card.dataset.id  = rule.id;
+  card.dataset.cat = rule.enforcement_category || '';
+  card.tabIndex = 0;
+
+  const text = rule.rule_text || '';
+  const long = text.length > 300;
+
+  const meta = [];
+  if (rule.source_db)    meta.push(`<span class="tag">${esc(rule.source_db)}</span>`);
+  if (rule.rule_source)  meta.push(`<span class="tag source">${esc(rule.rule_source)}</span>`);
+  if (rule.source_label) meta.push(`<span class="tag source">${esc(rule.source_label)}</span>`);
+  if (rule.repo_name)    meta.push(`<span class="tag">${esc(rule.repo_name)}</span>`);
+  if (rule.file_type)    meta.push(`<span class="tag">${esc(rule.file_type)}</span>`);
+  if (rule.source_url)   meta.push(`<a href="${esc(rule.source_url)}" target="_blank">source ↗</a>`);
+
+  const mechOpts = MECHANISMS.map(m =>
+    `<option value="${m}" ${rule.enforcement_mechanism === m ? 'selected':''}>${m||'— mechanism —'}</option>`
+  ).join('');
+
+  const actions = processed ? `
+    <div class="rule-actions">
+      <button class="action-btn det ${rule.enforcement_category==='deterministic'?'active':''}">Deterministic</button>
+      <button class="action-btn mix ${rule.enforcement_category==='mixed'?'active':''}">Mixed</button>
+      <button class="action-btn llm ${rule.enforcement_category==='llm'?'active':''}">LLM-only</button>
+      <select class="mech-select">${mechOpts}</select>
+      ${rule.enforcement_category ? '<button class="action-btn clr">✕</button>' : ''}
+    </div>` : '';
+
+  card.innerHTML = `
+    <div class="rule-text ${long ? '' : 'expanded'}">${esc(text)}</div>
+    ${long ? '<button class="expand-btn">Show more ▾</button>' : ''}
+    <div class="rule-meta">${meta.join('')}</div>
+    ${actions}
+  `;
+
+  // Expand
+  card.querySelector('.expand-btn')?.addEventListener('click', function() {
+    card.querySelector('.rule-text').classList.add('expanded');
+    this.remove();
+  });
+
+  // Category buttons
+  card.querySelector('.action-btn.det')?.addEventListener('click', () => categorize(card, 'deterministic'));
+  card.querySelector('.action-btn.mix')?.addEventListener('click', () => categorize(card, 'mixed'));
+  card.querySelector('.action-btn.llm')?.addEventListener('click', () => categorize(card, 'llm'));
+  card.querySelector('.action-btn.clr')?.addEventListener('click', () => categorize(card, null));
+  card.querySelector('.mech-select')?.addEventListener('change', e => saveMech(card, e.target.value));
+
+  card.addEventListener('focus', () => { S.focusedCard = card; });
+  return card;
+}
+
+async function renderRules(reset = false) {
+  if (S.loading) return;
+  S.loading = true;
+
+  const list = document.getElementById('rulesList');
+  if (reset) { list.innerHTML = ''; S.offset = 0; S.focusedCard = null; }
+
+  try {
+    const data = await fetchRules();
+    S.offset += data.length;
+    S.mode = S.tab.startsWith('raw:') ? 'raw' : 'processed';
+
+    const t = S.tabs.find(x => x.key === S.tab);
+    document.getElementById('totalInfo').textContent =
+      `${S.total.toLocaleString()} rules · ${t?.label || S.tab}`;
+
+    data.forEach(rule => list.appendChild(makeCard(rule)));
+    document.getElementById('loadMoreDiv').style.display =
+      S.offset < S.total ? 'block' : 'none';
+  } catch(e) {
+    list.insertAdjacentHTML('beforeend',
+      `<div class="error-banner">Query error: ${esc(e.message)}</div>`);
+  }
+
+  S.loading = false;
+}
+
+async function refreshAll(resetRules = true) {
+  await computeTabs();
+  renderDbList();
+  renderCatList();
+  renderProgress();
+  await renderSources();
+  await renderRules(resetRules);
+}
+
+// ── Categorization ────────────────────────────────────────────────────────
+
+async function categorize(card, category) {
+  const id   = card.dataset.id;
+  const mech = card.querySelector('.mech-select')?.value || null;
+
+  await S.conn.query(`
+    UPDATE proc.processed_rules
+    SET enforcement_category  = ${sqlStr(category)},
+        enforcement_mechanism = ${sqlStr(mech)}
+    WHERE id = ${sqlStr(id)}
+  `);
+
+  card.className = 'rule-card' + (category ? ' cat-' + category : '');
+  card.dataset.cat = category || '';
+
+  // Update buttons
+  card.querySelectorAll('.action-btn').forEach(b => b.classList.remove('active'));
+  const cls = { deterministic:'det', mixed:'mix', llm:'llm' }[category];
+  if (cls) card.querySelector(`.action-btn.${cls}`)?.classList.add('active');
+
+  // Add/remove clear button
+  const actions = card.querySelector('.rule-actions');
+  const existing = card.querySelector('.action-btn.clr');
+  if (category && !existing && actions) {
+    const clr = document.createElement('button');
+    clr.className = 'action-btn clr';
+    clr.textContent = '✕';
+    clr.addEventListener('click', () => categorize(card, null));
+    actions.appendChild(clr);
+  } else if (!category && existing) {
+    existing.remove();
+  }
+
+  if (S.category === 'uncategorized') {
+    const all  = [...document.querySelectorAll('.rule-card')];
+    const next = all[all.indexOf(card) + 1];
+    card.remove();
+    next?.focus();
+  }
+
+  markDirty();
+  await computeTabs();
+  renderCatList();
+  renderProgress();
+}
+
+async function saveMech(card, mech) {
+  const id  = card.dataset.id;
+  const cat = card.dataset.cat || null;
+  if (!cat) return;
+  await S.conn.query(`
+    UPDATE proc.processed_rules
+    SET enforcement_mechanism = ${sqlStr(mech)}
+    WHERE id = ${sqlStr(id)}
+  `);
+  markDirty();
+}
+
+// ── Navigation ────────────────────────────────────────────────────────────
+
+async function selectTab(key) {
+  S.tab = key; S.category = 'all'; S.source = ''; S.offset = 0;
+  renderDbList(); renderCatList(); renderProgress();
+  await renderSources();
+  await renderRules(true);
+}
+
+async function selectCat(cat) {
+  S.category = cat; S.offset = 0;
+  renderCatList();
+  await renderSources();
+  await renderRules(true);
+}
+
+async function selectSource(src) {
+  S.source = src; S.offset = 0;
+  await renderSources();
+  await renderRules(true);
+}
+
+// ── Keyboard shortcuts ────────────────────────────────────────────────────
+
+document.addEventListener('keydown', e => {
+  if (e.target === document.getElementById('searchInput')) return;
+  const card = S.focusedCard || document.querySelector('.rule-card:hover');
+  if (!card || S.mode !== 'processed') return;
+  const key = e.key.toLowerCase();
+  if (key === 'd') { e.preventDefault(); categorize(card, 'deterministic'); }
+  if (key === 'm') { e.preventDefault(); categorize(card, 'mixed'); }
+  if (key === 'l') { e.preventDefault(); categorize(card, 'llm'); }
+  if (key === 'x') { e.preventDefault(); categorize(card, null); }
+  if (key === 'arrowdown' || key === 'j') {
+    e.preventDefault();
+    const all = [...document.querySelectorAll('.rule-card')];
+    all[all.indexOf(card) + 1]?.focus();
+  }
+  if (key === 'arrowup' || key === 'k') {
+    e.preventDefault();
+    const all = [...document.querySelectorAll('.rule-card')];
+    all[all.indexOf(card) - 1]?.focus();
+  }
+});
+
+// ── Splash rendering ──────────────────────────────────────────────────────
+
+function renderSlots(statuses) {
+  // statuses: { key: 'loading'|'loaded'|'failed'|'skipped' }
+  const icons = { loading: '⏳', loaded: '✓', failed: '✕', skipped: '—' };
+  const labels = { loading: 'Loading…', loaded: 'Loaded', failed: 'Not found', skipped: 'Optional' };
+  document.getElementById('fileSlots').innerHTML = DB_SLOTS.map(slot => {
+    const st = statuses[slot.key] || 'loading';
+    return `
+      <div class="file-slot ${st === 'loaded' ? 'loaded' : st === 'failed' ? 'failed' : 'loading'}">
+        <div class="slot-icon">${icons[st]}</div>
+        <div class="slot-info">
+          <div class="slot-name">${slot.file}</div>
+          <div class="slot-desc">${slot.desc}${slot.required ? ' (required)' : ' (optional)'}</div>
+        </div>
+        <div class="slot-action">${labels[st]}</div>
+      </div>
+    `;
+  }).join('');
+}
+
+// ── Boot ──────────────────────────────────────────────────────────────────
+
+async function boot() {
+  // Init DuckDB
+  S.db   = await initDuckDB();
+  S.conn = await S.db.connect();
+
+  // Load each DB file from relative URL, update splash as we go
+  const statuses = {};
+  DB_SLOTS.forEach(s => { statuses[s.key] = 'loading'; });
+  renderSlots(statuses);
+
+  let requiredOk = false;
+  for (const slot of DB_SLOTS) {
+    try {
+      const ok = await fetchDbFile(slot.key, slot.file);
+      if (ok) {
+        await attachDb(slot.key);
+        S.loaded.add(slot.key);
+        statuses[slot.key] = 'loaded';
+        if (slot.key === 'processed') requiredOk = true;
+      } else {
+        statuses[slot.key] = slot.required ? 'failed' : 'skipped';
+      }
+    } catch(e) {
+      console.warn(`Failed to load ${slot.file}:`, e);
+      statuses[slot.key] = slot.required ? 'failed' : 'skipped';
+    }
+    renderSlots(statuses);
+  }
+
+  if (!requiredOk) {
+    const err = document.getElementById('splashError');
+    err.style.display = '';
+    err.textContent = 'Could not load processed.db — make sure it is in the same directory as index.html.';
+    return;
+  }
+
+  // Switch to main app
+  document.getElementById('splash').style.display = 'none';
+  document.getElementById('app').style.display    = 'flex';
+
+  renderLoadedFiles();
+  await refreshAll(true);
+
+  // Download button
+  document.getElementById('downloadBtn').addEventListener('click', downloadDb);
+
+  // Search (debounced)
+  let searchTimer;
+  document.getElementById('searchInput').addEventListener('input', e => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => {
+      S.search = e.target.value;
+      S.offset = 0;
+      renderSources();
+      renderRules(true);
+    }, 300);
+  });
+
+  // Load more / infinite scroll
+  document.getElementById('loadMoreBtn').addEventListener('click', () => renderRules(false));
+  document.getElementById('mainScroll').addEventListener('scroll', e => {
+    const el = e.target;
+    if (!S.loading && S.offset < S.total &&
+        el.scrollTop + el.clientHeight >= el.scrollHeight - 200) {
+      renderRules(false);
+    }
+  });
+
+  // "Open more" is not available in static mode — hide the button
+  document.getElementById('openMoreBtn').style.display = 'none';
+}
+
+function renderLoadedFiles() {
+  document.getElementById('loadedFiles').innerHTML = [...S.loaded].map(k => `
+    <div class="loaded-file"><span class="dot"></span>${k}.db</div>
+  `).join('');
+}
+
+boot().catch(e => {
+  document.getElementById('splash').innerHTML =
+    `<div class="splash-card"><h1>Error</h1><p style="color:#f66">${esc(e.message)}</p></div>`;
+});
+</script>
+</body>
+</html>
