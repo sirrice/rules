@@ -242,32 +242,30 @@ async function attachDb(key) {
   const fname  = `${key}.db`;
   const schema = key; // use key as schema name
   try {
-    if (key === 'processed') {
-      await S.conn.query(`ATTACH '${fname}' AS proc`);
-      // Ensure schema exists
-      await S.conn.query(`
-        CREATE TABLE IF NOT EXISTS proc.processed_rules (
-          id VARCHAR PRIMARY KEY,
-          source_db VARCHAR NOT NULL,
-          source_id VARCHAR NOT NULL,
-          source_url VARCHAR,
-          repo_name VARCHAR,
-          rule_source VARCHAR,
-          rule_text TEXT NOT NULL,
-          rule_index INTEGER,
-          enforcement_category VARCHAR,
-          enforcement_mechanism VARCHAR,
-          enforcement_notes TEXT,
-          processed_at TIMESTAMP
-        )
-      `);
-    } else {
-      await S.conn.query(`ATTACH '${fname}' AS ${schema} (READ_ONLY)`);
-    }
+    await S.conn.query(`ATTACH '${fname}' AS ${schema} (READ_ONLY)`);
   } catch (e) {
     console.warn(`ATTACH ${key} failed:`, e.message);
     throw e;
   }
+}
+
+async function ensureProcessedTable() {
+  await S.conn.query(`
+    CREATE TABLE IF NOT EXISTS processed_rules (
+      id VARCHAR PRIMARY KEY,
+      source_db VARCHAR NOT NULL,
+      source_id VARCHAR NOT NULL,
+      source_url VARCHAR,
+      repo_name VARCHAR,
+      rule_source VARCHAR,
+      rule_text TEXT NOT NULL,
+      rule_index INTEGER,
+      enforcement_category VARCHAR,
+      enforcement_mechanism VARCHAR,
+      enforcement_notes TEXT,
+      processed_at TIMESTAMP
+    )
+  `);
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
@@ -310,8 +308,16 @@ async function scalar(sql) {
 
 async function downloadDb() {
   try {
-    await S.conn.query('CHECKPOINT proc');
-    const buf  = await S.db.copyFileToBuffer('processed.db');
+    // Export in-memory data to a fresh DuckDB file buffer
+    const exportName = '_processed_export.db';
+    await S.db.registerFileBuffer(exportName, new Uint8Array(0));
+    await S.conn.query(`ATTACH '${exportName}' AS proc_export`);
+    await S.conn.query(`CREATE TABLE proc_export.processed_rules AS SELECT * FROM processed_rules`);
+    await S.conn.query(`CHECKPOINT proc_export`);
+    const buf = await S.db.copyFileToBuffer(exportName);
+    await S.conn.query(`DETACH proc_export`);
+    await S.db.dropFile(exportName);
+
     const blob = new Blob([buf], { type: 'application/octet-stream' });
     const url  = URL.createObjectURL(blob);
     const a    = document.createElement('a');
@@ -347,19 +353,19 @@ async function computeTabs() {
   if (S.loaded.has('processed')) {
     // "All" tab + per-source-db tabs from processed
     const sourceDbs = await rows(
-      `SELECT source_db, COUNT(*) AS n FROM proc.processed_rules GROUP BY 1 ORDER BY 2 DESC`
+      `SELECT source_db, COUNT(*) AS n FROM processed_rules GROUP BY 1 ORDER BY 2 DESC`
     );
-    const total = await scalar('SELECT COUNT(*) FROM proc.processed_rules');
-    const det   = await scalar(`SELECT COUNT(*) FROM proc.processed_rules WHERE enforcement_category='deterministic'`);
-    const llm   = await scalar(`SELECT COUNT(*) FROM proc.processed_rules WHERE enforcement_category='llm'`);
-    const mix   = await scalar(`SELECT COUNT(*) FROM proc.processed_rules WHERE enforcement_category='mixed'`);
+    const total = await scalar('SELECT COUNT(*) FROM processed_rules');
+    const det   = await scalar(`SELECT COUNT(*) FROM processed_rules WHERE enforcement_category='deterministic'`);
+    const llm   = await scalar(`SELECT COUNT(*) FROM processed_rules WHERE enforcement_category='llm'`);
+    const mix   = await scalar(`SELECT COUNT(*) FROM processed_rules WHERE enforcement_category='mixed'`);
     const unc   = total - det - llm - mix;
     tabs.push({ key:'_all', label:'all (processed)', mode:'processed', total, det, llm, mix, unc });
 
     for (const { source_db, n } of sourceDbs) {
-      const d = await scalar(`SELECT COUNT(*) FROM proc.processed_rules WHERE source_db=${sqlStr(source_db)} AND enforcement_category='deterministic'`);
-      const l = await scalar(`SELECT COUNT(*) FROM proc.processed_rules WHERE source_db=${sqlStr(source_db)} AND enforcement_category='llm'`);
-      const m = await scalar(`SELECT COUNT(*) FROM proc.processed_rules WHERE source_db=${sqlStr(source_db)} AND enforcement_category='mixed'`);
+      const d = await scalar(`SELECT COUNT(*) FROM processed_rules WHERE source_db=${sqlStr(source_db)} AND enforcement_category='deterministic'`);
+      const l = await scalar(`SELECT COUNT(*) FROM processed_rules WHERE source_db=${sqlStr(source_db)} AND enforcement_category='llm'`);
+      const m = await scalar(`SELECT COUNT(*) FROM processed_rules WHERE source_db=${sqlStr(source_db)} AND enforcement_category='mixed'`);
       tabs.push({ key: source_db, label: source_db, mode:'processed',
                   total: n, det: d, llm: l, mix: m, unc: n - d - l - m });
     }
@@ -407,12 +413,12 @@ async function fetchRules() {
       LIMIT ${PAGE} OFFSET ${S.offset}
     `);
   } else {
-    S.total = await scalar(`SELECT COUNT(*) FROM proc.processed_rules ${where}`);
+    S.total = await scalar(`SELECT COUNT(*) FROM processed_rules ${where}`);
     return rows(`
       SELECT id, rule_text, source_url, repo_name,
              enforcement_category, enforcement_mechanism, enforcement_notes,
              rule_index, source_db, rule_source, NULL AS file_type, NULL AS source_label
-      FROM proc.processed_rules ${where}
+      FROM processed_rules ${where}
       ORDER BY source_db, rule_index ASC NULLS LAST, id
       LIMIT ${PAGE} OFFSET ${S.offset}
     `);
@@ -431,7 +437,7 @@ async function fetchSources() {
     else if (S.category !== 'all') parts.push(`enforcement_category = ${sqlStr(S.category)}`);
     if (S.search) parts.push(`LOWER(rule_text) LIKE ${sqlStr('%'+S.search.toLowerCase()+'%')}`);
     const w = parts.length ? 'WHERE ' + parts.join(' AND ') : '';
-    return rows(`SELECT rule_source AS source, COUNT(*) AS n FROM proc.processed_rules ${w} GROUP BY 1 ORDER BY 2 DESC`);
+    return rows(`SELECT rule_source AS source, COUNT(*) AS n FROM processed_rules ${w} GROUP BY 1 ORDER BY 2 DESC`);
   }
 }
 
@@ -605,7 +611,7 @@ async function categorize(card, category) {
   const mech = card.querySelector('.mech-select')?.value || null;
 
   await S.conn.query(`
-    UPDATE proc.processed_rules
+    UPDATE processed_rules
     SET enforcement_category  = ${sqlStr(category)},
         enforcement_mechanism = ${sqlStr(mech)}
     WHERE id = ${sqlStr(id)}
@@ -650,7 +656,7 @@ async function saveMech(card, mech) {
   const cat = card.dataset.cat || null;
   if (!cat) return;
   await S.conn.query(`
-    UPDATE proc.processed_rules
+    UPDATE processed_rules
     SET enforcement_mechanism = ${sqlStr(mech)}
     WHERE id = ${sqlStr(id)}
   `);
@@ -727,23 +733,52 @@ function renderSlots(statuses) {
 
 async function boot() {
   // Init DuckDB
-  S.db   = await initDuckDB();
-  S.conn = await S.db.connect();
+  S.db = await initDuckDB();
 
   // Load each DB file from relative URL, update splash as we go
   const statuses = {};
   DB_SLOTS.forEach(s => { statuses[s.key] = 'loading'; });
   renderSlots(statuses);
 
+  // Main DB stays :memory: (DuckDB WASM buffer files are read-only).
+  // processed.db is loaded read-only and imported into memory.
+  S.conn = await S.db.connect();
+
   let requiredOk = false;
-  for (const slot of DB_SLOTS) {
+  const processedSlot = DB_SLOTS.find(s => s.key === 'processed');
+  try {
+    const resp = await fetch(processedSlot.file);
+    if (resp.ok) {
+      const buffer = new Uint8Array(await resp.arrayBuffer());
+      await S.db.registerFileBuffer('processed.db', buffer);
+      await ensureProcessedTable();
+      // Import existing data from the read-only buffer
+      try {
+        await S.conn.query(`ATTACH 'processed.db' AS proc_src (READ_ONLY)`);
+        await S.conn.query(`INSERT INTO processed_rules BY NAME SELECT * FROM proc_src.processed_rules`);
+        await S.conn.query(`DETACH proc_src`);
+      } catch(importErr) {
+        // Source table may not exist yet (fresh db) — that's fine
+      }
+      S.loaded.add('processed');
+      statuses['processed'] = 'loaded';
+      requiredOk = true;
+    } else {
+      statuses['processed'] = 'failed';
+    }
+  } catch(e) {
+    console.warn('Failed to load processed.db:', e);
+    statuses['processed'] = 'failed';
+  }
+  renderSlots(statuses);
+
+  for (const slot of DB_SLOTS.filter(s => s.key !== 'processed')) {
     try {
       const ok = await fetchDbFile(slot.key, slot.file);
       if (ok) {
         await attachDb(slot.key);
         S.loaded.add(slot.key);
         statuses[slot.key] = 'loaded';
-        if (slot.key === 'processed') requiredOk = true;
       } else {
         statuses[slot.key] = slot.required ? 'failed' : 'skipped';
       }
