@@ -1,0 +1,1455 @@
+#!/usr/bin/env python3
+"""
+annotate.py – Interactive rule annotation webapp.
+
+Browse files from sample.db, manually select text to extract rules,
+run Perplexity/OpenAI/Claude LLM prompts to auto-extract, and compare
+extractions side-by-side with per-extractor colour coding.
+
+Keyboard shortcuts:
+  Cmd+Enter   Add selected text as rule
+  j / k       Navigate rule cards
+  n           Open note editor on focused rule
+  d           Delete focused rule
+  Enter       Save note
+  Escape      Cancel note / clear selection
+
+Usage:
+  export PERPLEXITY_API_KEY=pplx-...
+  python3 annotate.py
+  open http://localhost:5002
+"""
+
+import hashlib, json, os, re, urllib.request, urllib.error
+from datetime import datetime, timezone
+import duckdb
+from flask import Flask, jsonify, request
+
+BASE_DIR       = os.path.dirname(os.path.abspath(__file__))
+SAMPLE_DB      = os.path.join(BASE_DIR, "sample.db")
+ANNOT_DB       = os.path.join(BASE_DIR, "annotations.db")
+PERPLEXITY_CHAT_URL  = "https://api.perplexity.ai/chat/completions"
+PERPLEXITY_AGENT_URL = "https://api.perplexity.ai/v1/agent"
+
+app = Flask(__name__)
+
+# ---------------------------------------------------------------------------
+# .env loader
+# ---------------------------------------------------------------------------
+_env_path = os.path.join(BASE_DIR, ".env")
+if os.path.exists(_env_path):
+    for _l in open(_env_path):
+        _l = _l.strip()
+        if _l and not _l.startswith("#") and "=" in _l:
+            _k, _v = _l.split("=", 1)
+            os.environ.setdefault(_k.strip(), _v.strip())
+
+# ---------------------------------------------------------------------------
+# DB
+# ---------------------------------------------------------------------------
+def annot_con():
+    con = duckdb.connect(ANNOT_DB)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS extracted_rules (
+            id           VARCHAR PRIMARY KEY,
+            file_id      VARCHAR NOT NULL,
+            rule_text    TEXT    NOT NULL,
+            char_start   INTEGER,
+            char_end     INTEGER,
+            line_start   INTEGER,
+            line_end     INTEGER,
+            source       VARCHAR NOT NULL,
+            llm_run_id   VARCHAR,
+            notes        VARCHAR,
+            extracted_by VARCHAR,
+            created_at   TIMESTAMP DEFAULT now()
+        )
+    """)
+    for col in ("notes VARCHAR", "extracted_by VARCHAR"):
+        try: con.execute(f"ALTER TABLE extracted_rules ADD COLUMN {col}")
+        except Exception: pass
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS llm_runs (
+            id           VARCHAR PRIMARY KEY,
+            file_id      VARCHAR NOT NULL,
+            prompt       TEXT,
+            model        VARCHAR,
+            raw_response TEXT,
+            rule_count   INTEGER DEFAULT 0,
+            created_at   TIMESTAMP DEFAULT now()
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS saved_prompts (
+            id        VARCHAR PRIMARY KEY,
+            prompt    TEXT NOT NULL,
+            label     VARCHAR,
+            saved_at  TIMESTAMP DEFAULT now()
+        )
+    """)
+    return con
+
+_sample_ro = None
+def sample_con():
+    global _sample_ro
+    if _sample_ro is None and os.path.exists(SAMPLE_DB):
+        _sample_ro = duckdb.connect(SAMPLE_DB, read_only=True)
+    return _sample_ro
+
+def make_id(*parts):
+    return hashlib.sha256(":".join(str(p) for p in parts).encode()).hexdigest()[:16]
+
+# ---------------------------------------------------------------------------
+# Routes – files
+# ---------------------------------------------------------------------------
+@app.route("/")
+def index(): return HTML
+
+@app.route("/api/files")
+def api_files():
+    sc = sample_con()
+    if not sc:
+        return jsonify({"error": "sample.db not found – run extract_sample.py first"}), 404
+    rows = sc.execute(
+        "SELECT id, source_url, repo_name, file_type, content_len, source "
+        "FROM sample ORDER BY content_len DESC"
+    ).fetchall()
+    con = annot_con()
+    raw = con.execute(
+        "SELECT file_id, source, COUNT(*) FROM extracted_rules GROUP BY 1,2"
+    ).fetchall()
+    con.close()
+    counts = {}
+    for fid, src, n in raw:
+        counts.setdefault(fid, {})[src] = n
+    return jsonify([{
+        "id": r[0], "source_url": r[1], "repo_name": r[2],
+        "file_type": r[3], "content_len": r[4], "source": r[5],
+        "hand_count": counts.get(r[0], {}).get("hand", 0),
+        "llm_count":  counts.get(r[0], {}).get("llm",  0),
+    } for r in rows])
+
+@app.route("/api/file/<fid>")
+def api_file(fid):
+    sc = sample_con()
+    if not sc: return jsonify({"error": "sample.db not found"}), 404
+    row = sc.execute(
+        "SELECT id, source_url, raw_url, repo_name, file_type, content, content_len, source "
+        "FROM sample WHERE id=?", [fid]
+    ).fetchone()
+    if not row: return jsonify({"error": "not found"}), 404
+    return jsonify({
+        "id": row[0], "source_url": row[1], "raw_url": row[2],
+        "repo_name": row[3], "file_type": row[4],
+        "content": row[5] or "", "content_len": row[6], "source": row[7],
+    })
+
+# ---------------------------------------------------------------------------
+# Routes – rules
+# ---------------------------------------------------------------------------
+def _rule_row(r):
+    return {
+        "id": r[0], "rule_text": r[1],
+        "char_start": r[2], "char_end": r[3],
+        "line_start": r[4], "line_end": r[5],
+        "source": r[6], "llm_run_id": r[7],
+        "notes": r[8], "extracted_by": r[9],
+        "created_at": str(r[10]),
+    }
+
+@app.route("/api/rules/<fid>")
+def api_rules(fid):
+    con = annot_con()
+    rows = con.execute("""
+        SELECT id, rule_text, char_start, char_end, line_start, line_end,
+               source, llm_run_id, notes, extracted_by, created_at
+        FROM extracted_rules WHERE file_id=?
+        ORDER BY COALESCE(char_start,999999), created_at
+    """, [fid]).fetchall()
+    con.close()
+    return jsonify([_rule_row(r) for r in rows])
+
+@app.route("/api/rules", methods=["POST"])
+def save_rule():
+    b = request.json or {}
+    fid       = b.get("file_id","").strip()
+    rule_text = b.get("rule_text","").strip()
+    if not fid or not rule_text:
+        return jsonify({"error": "file_id and rule_text required"}), 400
+    rid = make_id(fid, "hand", rule_text)
+    by  = b.get("extracted_by") or "unknown"
+    con = annot_con()
+    con.execute("""
+        INSERT OR IGNORE INTO extracted_rules
+            (id,file_id,rule_text,char_start,char_end,line_start,line_end,
+             source,llm_run_id,notes,extracted_by)
+        VALUES(?,?,?,?,?,?,?,'hand',NULL,NULL,?)
+    """, [rid, fid, rule_text,
+          b.get("char_start"), b.get("char_end"),
+          b.get("line_start"), b.get("line_end"), by])
+    con.close()
+    return jsonify({
+        "id": rid, "rule_text": rule_text,
+        "char_start": b.get("char_start"), "char_end": b.get("char_end"),
+        "line_start": b.get("line_start"), "line_end": b.get("line_end"),
+        "source": "hand", "llm_run_id": None, "notes": None,
+        "extracted_by": by,
+    })
+
+@app.route("/api/rules/<rid>", methods=["PATCH"])
+def patch_rule(rid):
+    b = request.json or {}
+    notes = b.get("notes") or None
+    con = annot_con()
+    con.execute("UPDATE extracted_rules SET notes=? WHERE id=?", [notes, rid])
+    con.close()
+    return jsonify({"ok": True})
+
+@app.route("/api/rules/<rid>", methods=["DELETE"])
+def delete_rule(rid):
+    con = annot_con()
+    con.execute("DELETE FROM extracted_rules WHERE id=?", [rid])
+    con.close()
+    return jsonify({"ok": True})
+
+# ---------------------------------------------------------------------------
+# Routes – LLM
+# ---------------------------------------------------------------------------
+@app.route("/api/llm", methods=["POST"])
+def run_llm():
+    b       = request.json or {}
+    fid     = b.get("file_id","").strip()
+    prompt  = b.get("prompt","").strip()
+    model   = b.get("model","gpt-4o-mini").strip()
+    if not fid or not prompt:
+        return jsonify({"error": "file_id and prompt required"}), 400
+    api_key = os.environ.get("PERPLEXITY_API_KEY","")
+    if not api_key:
+        return jsonify({"error": "PERPLEXITY_API_KEY not set"}), 400
+    sc = sample_con()
+    row = sc.execute("SELECT content FROM sample WHERE id=?", [fid]).fetchone()
+    if not row: return jsonify({"error": "file not found"}), 404
+    content = row[0] or ""
+
+    sys_msg = (
+        "You are a precise rule extractor. Extract all behavioral rules, constraints, "
+        "guidelines, and instructions from the given file. "
+        "Return ONLY a valid JSON array, no other text. "
+        'Each element: {"rule_text":"<exact or near-exact quote>","line_start":<int>,"line_end":<int>}'
+    )
+    usr_msg = (
+        f"{prompt}\n\nFile content:\n---\n{content[:30000]}\n---\n\nReturn ONLY a JSON array."
+    )
+
+    # Third-party models (anthropic/*, openai/*) use the Agent API; native Sonar models use Chat API
+    use_agent_api = "/" in model
+    if use_agent_api:
+        payload = json.dumps({
+            "model": model,
+            "instructions": sys_msg,
+            "input": usr_msg,
+        }).encode()
+        url = PERPLEXITY_AGENT_URL
+    else:
+        payload = json.dumps({
+            "model": model,
+            "messages": [{"role":"system","content":sys_msg},{"role":"user","content":usr_msg}],
+            "temperature": 0.1, "max_tokens": 4096,
+        }).encode()
+        url = PERPLEXITY_CHAT_URL
+
+    req = urllib.request.Request(
+        url, data=payload,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            resp_data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        return jsonify({"error": f"API {e.code}: {e.read().decode()}"}), 502
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
+    if use_agent_api:
+        # Agent API: output[0].content[0].text
+        try:
+            raw = resp_data["output"][0]["content"][0]["text"]
+        except (KeyError, IndexError):
+            raw = ""
+    else:
+        raw = resp_data.get("choices",[{}])[0].get("message",{}).get("content","")
+    extracted = _parse_llm_rules(raw)
+
+    cl = content.lower()
+    for rule in extracted:
+        rt = rule.get("rule_text","")
+        if not rt: continue
+        idx = content.find(rt)
+        if idx == -1: idx = cl.find(rt.lower())
+        if idx >= 0:
+            rule["char_start"] = idx
+            rule["char_end"]   = idx + len(rt)
+            rule["line_start"] = content[:idx].count("\n") + 1
+            rule["line_end"]   = content[:idx+len(rt)].count("\n") + 1
+
+    run_id = make_id(fid, prompt, datetime.now(timezone.utc).isoformat())
+    con = annot_con()
+    con.execute(
+        "INSERT INTO llm_runs(id,file_id,prompt,model,raw_response,rule_count) VALUES(?,?,?,?,?,?)",
+        [run_id, fid, prompt, model, raw, len(extracted)]
+    )
+    saved = []
+    for rule in extracted:
+        rt = rule.get("rule_text","").strip()
+        if not rt: continue
+        eid = make_id(fid, "llm", run_id, rt)
+        con.execute("""
+            INSERT OR IGNORE INTO extracted_rules
+                (id,file_id,rule_text,char_start,char_end,line_start,line_end,
+                 source,llm_run_id,notes,extracted_by)
+            VALUES(?,?,?,?,?,?,?,'llm',?,NULL,?)
+        """, [eid, fid, rt,
+              rule.get("char_start"), rule.get("char_end"),
+              rule.get("line_start"), rule.get("line_end"),
+              run_id, model])
+        saved.append({
+            "id": eid, "rule_text": rt,
+            "char_start": rule.get("char_start"), "char_end": rule.get("char_end"),
+            "line_start": rule.get("line_start"), "line_end": rule.get("line_end"),
+            "source": "llm", "llm_run_id": run_id, "notes": None,
+            "extracted_by": model,
+        })
+    con.close()
+    return jsonify({"run_id": run_id, "rules": saved, "raw_response": raw})
+
+@app.route("/api/llm-runs/<run_id>", methods=["DELETE"])
+def delete_llm_run(run_id):
+    con = annot_con()
+    con.execute("DELETE FROM extracted_rules WHERE llm_run_id=?", [run_id])
+    con.execute("DELETE FROM llm_runs WHERE id=?", [run_id])
+    con.close()
+    return jsonify({"ok": True})
+
+# ---------------------------------------------------------------------------
+# Routes – saved prompts
+# ---------------------------------------------------------------------------
+@app.route("/api/prompts")
+def list_prompts():
+    con = annot_con()
+    rows = con.execute(
+        "SELECT id, prompt, label, saved_at FROM saved_prompts ORDER BY saved_at DESC"
+    ).fetchall()
+    con.close()
+    return jsonify([{"id":r[0],"prompt":r[1],"label":r[2],"saved_at":str(r[3])} for r in rows])
+
+@app.route("/api/prompts", methods=["POST"])
+def save_prompt():
+    b = request.json or {}
+    prompt = (b.get("prompt") or "").strip()
+    label  = (b.get("label")  or "").strip() or None
+    if not prompt: return jsonify({"error": "prompt required"}), 400
+    pid = make_id(prompt, datetime.now(timezone.utc).isoformat())
+    con = annot_con()
+    con.execute(
+        "INSERT INTO saved_prompts(id,prompt,label) VALUES(?,?,?)", [pid, prompt, label]
+    )
+    con.close()
+    return jsonify({"id": pid, "prompt": prompt, "label": label})
+
+@app.route("/api/prompts/<pid>", methods=["DELETE"])
+def delete_prompt(pid):
+    con = annot_con()
+    con.execute("DELETE FROM saved_prompts WHERE id=?", [pid])
+    con.close()
+    return jsonify({"ok": True})
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _parse_llm_rules(text):
+    text = re.sub(r'^```(?:json)?\s*','',text.strip())
+    text = re.sub(r'\s*```$','',text).strip()
+    try:
+        d = json.loads(text)
+        if isinstance(d, list): return d
+    except: pass
+    m = re.search(r'\[.*\]', text, re.DOTALL)
+    if m:
+        try:
+            d = json.loads(m.group())
+            if isinstance(d, list): return d
+        except: pass
+    return [{"rule_text": re.sub(r'^[-*\d.]+\s*','',l.strip())}
+            for l in text.split('\n') if len(l.strip()) > 20]
+
+# ---------------------------------------------------------------------------
+# Frontend
+# ---------------------------------------------------------------------------
+HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Rule Annotator</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: #f0f0f6; height: 100vh; overflow: hidden; color: #1a1a2e;
+}
+.layout { display: flex; height: 100vh; }
+
+/* ── File panel ── */
+.file-panel {
+  width: 230px; flex-shrink: 0; background: #18182e;
+  display: flex; flex-direction: column; overflow: hidden;
+  border-right: 1px solid #2a2a4a;
+}
+.file-panel-head {
+  padding: 12px 12px 10px; color: #fff; font-size: 13px; font-weight: 700;
+  border-bottom: 1px solid #2a2a4a; flex-shrink: 0; display: flex;
+  align-items: baseline; gap: 6px;
+}
+.file-panel-head small { font-weight: 400; font-size: 11px; color: #5a5a7a; }
+.file-search { padding: 7px 10px; flex-shrink: 0; border-bottom: 1px solid #2a2a4a; }
+.file-search input {
+  width: 100%; padding: 5px 8px; border-radius: 6px; border: 1px solid #2a2a4a;
+  background: #0f0f22; color: #d0d0f0; font-size: 12px;
+}
+.file-search input:focus { outline: none; border-color: #5050a0; }
+.file-search input::placeholder { color: #4a4a6a; }
+.file-list { flex: 1; overflow-y: auto; padding: 5px 0; }
+.file-item {
+  padding: 6px 10px 6px 8px; cursor: pointer; border-left: 3px solid transparent;
+  transition: background 0.1s; display: flex; gap: 7px; align-items: flex-start;
+}
+.file-item:hover  { background: #22223a; }
+.file-item.active { background: #272750; border-left-color: #6366f1; }
+.file-idx { font-size: 10px; color: #4a4a6a; min-width: 22px; text-align: right; padding-top: 1px; flex-shrink: 0; font-variant-numeric: tabular-nums; }
+.file-item.active .file-idx { color: #7070b0; }
+.file-info { flex: 1; min-width: 0; }
+.file-name { font-size: 12px; color: #c0c0e0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.file-item.active .file-name { color: #fff; }
+.file-meta { font-size: 10px; color: #5a5a7a; margin-top: 2px; display: flex; gap: 5px; align-items: center; flex-wrap: wrap; }
+.badge { display: inline-flex; align-items: center; gap: 2px; padding: 1px 5px; border-radius: 10px; font-size: 10px; font-weight: 600; }
+
+/* ── Viewer ── */
+.viewer-panel {
+  flex: 1; display: flex; flex-direction: column; overflow: hidden;
+  background: #fff; border-right: 1px solid #e0e0ea;
+}
+.viewer-head {
+  padding: 9px 14px; background: #fafafa; border-bottom: 1px solid #eaeaf0;
+  flex-shrink: 0; display: flex; align-items: center; gap: 10px; min-height: 40px;
+}
+.viewer-title { font-size: 13px; font-weight: 600; color: #333; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; }
+.viewer-head a { font-size: 11px; color: #6366f1; text-decoration: none; flex-shrink: 0; }
+.viewer-head a:hover { text-decoration: underline; }
+.sel-bar {
+  padding: 5px 14px; background: #f4f4fc; border-bottom: 1px solid #e4e4f0;
+  display: flex; align-items: center; gap: 10px; flex-shrink: 0; min-height: 34px;
+}
+.sel-info { font-size: 11px; color: #7a7aaa; flex: 1; }
+.sel-info .kb { color: #aaa; font-size: 10px; }
+kbd {
+  display: inline-block; padding: 1px 4px; border-radius: 3px;
+  border: 1px solid #ccc; background: #f8f8f8; font-size: 10px;
+  font-family: inherit; color: #555; line-height: 1.4;
+}
+.add-btn {
+  padding: 3px 12px; border-radius: 20px; border: 1.5px solid #f59e0b;
+  color: #f59e0b; background: transparent; font-size: 12px; font-weight: 600;
+  cursor: pointer; transition: all 0.12s; white-space: nowrap;
+}
+.add-btn:hover:not(:disabled) { background: #f59e0b; color: #fff; }
+.add-btn:disabled { opacity: 0.32; cursor: default; }
+.viewer-body {
+  flex: 1; display: flex; overflow: auto;
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+  font-size: 13px; line-height: 1.6;
+}
+.line-nums {
+  white-space: pre; padding: 14px 10px 14px 12px; color: #bbbbd0;
+  text-align: right; user-select: none; border-right: 1px solid #f0f0f8;
+  flex-shrink: 0; min-width: 44px;
+}
+.content-pre {
+  flex: 1; padding: 14px 16px; margin: 0;
+  white-space: pre-wrap; word-break: break-word;
+  overflow: visible; background: transparent; cursor: text;
+}
+
+/* ── Line highlights ── */
+.line-hl {
+  display: inline;
+  cursor: pointer;
+  border-radius: 0 3px 3px 0;
+  transition: background 0.1s;
+}
+.line-hl:hover { filter: brightness(0.92); }
+
+/* ── Rules panel ── */
+.rules-panel {
+  width: 310px; flex-shrink: 0; display: flex; flex-direction: column;
+  overflow: hidden; background: #fafafd;
+}
+
+/* annotator name bar */
+.name-bar {
+  padding: 7px 12px; background: #f0f0fa; border-bottom: 1px solid #e0e0f0;
+  display: flex; align-items: center; gap: 8px; flex-shrink: 0;
+}
+.name-bar label { font-size: 11px; color: #7a7aaa; white-space: nowrap; }
+.name-input {
+  flex: 1; padding: 3px 7px; border-radius: 5px; border: 1px solid #d0d0e8;
+  background: white; font-size: 12px; color: #333;
+}
+.name-input:focus { outline: none; border-color: #6366f1; }
+
+.rules-section { display: flex; flex-direction: column; overflow: hidden; }
+.rules-section.hand-section { flex: 0 0 auto; max-height: 44%; border-bottom: 2px solid #e8e8f4; }
+.rules-section.llm-section  { flex: 1; overflow: hidden; }
+.section-head {
+  padding: 7px 12px; font-size: 12px; font-weight: 700; letter-spacing: 0.2px;
+  display: flex; align-items: center; justify-content: space-between; flex-shrink: 0;
+  background: #f4f4fc; border-bottom: 1px solid #e4e4f0;
+}
+.section-count {
+  font-size: 11px; font-weight: 700; padding: 1px 7px; border-radius: 10px;
+  background: #e8e8f8; color: #6060a0;
+}
+.rules-list { overflow-y: auto; flex: 1; padding: 5px; }
+
+/* rule card – border/bg via CSS variables */
+.rule-card {
+  padding: 7px 9px; border-radius: 6px;
+  border-left: 3px solid var(--rc-bdr, #d0d0e8);
+  background: var(--rc-bg, #f8f8fc);
+  margin-bottom: 4px; cursor: pointer; font-size: 12px; line-height: 1.5;
+  display: flex; align-items: flex-start; gap: 6px;
+  transition: background 0.1s; word-break: break-word;
+}
+.rule-card:hover  { background: var(--rc-hov, #f0f0f8); }
+.rule-card.focused {
+  background: var(--rc-act, #e8e8f4);
+  box-shadow: 0 0 0 1.5px var(--rc-bdr, #9090c0);
+}
+.rule-card.no-pos { opacity: 0.75; }
+.extractor-tag {
+  display: inline-block; font-size: 9px; font-weight: 700; padding: 1px 5px;
+  border-radius: 8px; background: var(--rc-bg2, #e8e8f4); color: var(--rc-bdr, #6060a0);
+  margin-bottom: 3px; letter-spacing: 0.2px; vertical-align: middle;
+}
+.rule-body { flex: 1; min-width: 0; }
+.rule-preview { color: #2a2a3e; margin-bottom: 2px; }
+.rule-pos { font-size: 10px; color: #9090b0; }
+.rule-note-text { margin-top: 4px; font-size: 11px; color: #6060a0; font-style: italic; white-space: pre-wrap; }
+.rule-note-editor { display: none; margin-top: 5px; }
+.rule-note-editor.open { display: block; }
+.rule-note-input {
+  width: 100%; padding: 4px 7px; border-radius: 5px;
+  border: 1.5px solid #6366f1; background: white; font-size: 11px;
+  font-family: inherit; color: #333; resize: none; line-height: 1.4;
+}
+.rule-note-input:focus { outline: none; }
+.note-hint { font-size: 10px; color: #aaa; margin-top: 2px; }
+.rule-actions { display: flex; flex-direction: column; gap: 2px; flex-shrink: 0; }
+.rule-btn {
+  background: none; border: none; cursor: pointer; padding: 2px 3px;
+  border-radius: 3px; font-size: 13px; line-height: 1; color: #c0c0d8;
+}
+.rule-btn:hover { background: rgba(0,0,0,.07); color: #555; }
+.rule-btn.del:hover { color: #e53e3e; background: rgba(229,62,62,.1); }
+.rule-btn.note-btn.has-note { color: #6366f1; }
+
+/* empty states */
+.empty-hint { color: #b0b0c8; font-size: 12px; text-align: center; padding: 14px 8px; }
+.viewer-empty { flex: 1; display: flex; align-items: center; justify-content: center; color: #b0b0c8; font-size: 14px; }
+
+/* LLM controls */
+.llm-controls {
+  padding: 8px 11px; border-bottom: 1px solid #e8e8f4;
+  flex-shrink: 0; display: flex; flex-direction: column; gap: 6px;
+}
+.llm-row { display: flex; gap: 6px; align-items: center; }
+.llm-model {
+  flex: 1; padding: 5px 7px; border-radius: 6px; border: 1px solid #d0d0e0;
+  background: white; font-size: 12px; color: #333;
+}
+.llm-prompt {
+  width: 100%; min-height: 60px; padding: 6px 8px; border-radius: 6px;
+  border: 1px solid #d0d0e0; background: white; font-size: 12px; color: #333;
+  resize: vertical; font-family: inherit; line-height: 1.4;
+}
+.llm-prompt:focus, .llm-model:focus, .llm-label:focus { outline: none; border-color: #6366f1; }
+.run-btn {
+  padding: 5px 14px; border-radius: 20px; border: none; background: #6366f1;
+  color: white; font-size: 12px; font-weight: 600; cursor: pointer; flex-shrink: 0;
+}
+.run-btn:hover:not(:disabled) { background: #4f46e5; }
+.run-btn:disabled { opacity: 0.5; cursor: default; }
+.icon-btn {
+  padding: 4px 8px; border-radius: 6px; border: 1px solid #d0d0e0;
+  background: transparent; color: #7070a0; font-size: 11px; cursor: pointer;
+  white-space: nowrap;
+}
+.icon-btn:hover { border-color: #6366f1; color: #4338ca; }
+.icon-btn:disabled { opacity: 0.4; cursor: default; }
+.llm-status { font-size: 11px; color: #7070a0; min-height: 15px; flex: 1; }
+.llm-status.error { color: #e53e3e; }
+.llm-status.ok    { color: #22c55e; }
+
+/* prompt history */
+.prompt-history {
+  border: 1px solid #e0e0f0; border-radius: 6px; background: white;
+  max-height: 120px; overflow-y: auto; display: none;
+}
+.prompt-history.open { display: block; }
+.ph-item {
+  padding: 5px 9px; font-size: 11px; color: #444; cursor: pointer;
+  border-bottom: 1px solid #f0f0f8; display: flex; gap: 6px; align-items: flex-start;
+}
+.ph-item:last-child { border-bottom: none; }
+.ph-item:hover { background: #f4f4fc; }
+.ph-text { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ph-label { font-size: 10px; font-weight: 600; color: #6366f1; flex-shrink: 0; }
+.ph-date  { font-size: 10px; color: #aaa; flex-shrink: 0; }
+.ph-del   { font-size: 13px; color: #ccc; background: none; border: none; cursor: pointer; flex-shrink: 0; padding: 0; }
+.ph-del:hover { color: #e53e3e; }
+
+/* bulk selection */
+.rule-card.selected { outline: 2px solid #6366f1; outline-offset: -2px; }
+.rule-checkbox { display: flex; align-items: flex-start; padding: 2px 4px 0 0; flex-shrink: 0; cursor: pointer; }
+.rule-checkbox input { cursor: pointer; accent-color: #6366f1; }
+.bulk-bar {
+  display: none; align-items: center; gap: 6px; padding: 6px 11px;
+  background: #eef2ff; border-bottom: 1px solid #c7d2fe; flex-shrink: 0; font-size: 12px;
+}
+.bulk-bar.visible { display: flex; }
+.bulk-count { color: #4338ca; font-weight: 600; flex: 1; }
+.bulk-btn {
+  padding: 3px 10px; border-radius: 12px; border: 1px solid #a5b4fc; background: white;
+  color: #4338ca; font-size: 11px; font-weight: 600; cursor: pointer; white-space: nowrap;
+}
+.bulk-btn:hover { background: #eef2ff; border-color: #6366f1; }
+.bulk-btn.danger { border-color: #fca5a5; color: #dc2626; }
+.bulk-btn.danger:hover { background: #fff1f1; border-color: #f87171; }
+.sel-all-btn {
+  font-size: 10px; font-weight: 500; color: #8080b0; background: none; border: none;
+  cursor: pointer; padding: 0 2px; text-decoration: underline dotted;
+}
+.sel-all-btn:hover { color: #4338ca; }
+
+/* keyboard bar */
+.kb-bar {
+  padding: 5px 10px; background: #f0f0f8; border-top: 1px solid #e0e0ee;
+  font-size: 10px; color: #9090b0; display: flex; gap: 8px; flex-wrap: wrap; flex-shrink: 0;
+}
+.kb-bar span { white-space: nowrap; }
+</style>
+</head>
+<body>
+<div class="layout">
+
+  <!-- ── File list ── -->
+  <div class="file-panel">
+    <div class="file-panel-head">Files <small id="fileCountLabel"></small></div>
+    <div class="file-search">
+      <input id="fileSearch" placeholder="filter…" oninput="filterFiles(this.value)">
+    </div>
+    <div class="file-list" id="fileList"></div>
+  </div>
+
+  <!-- ── Viewer ── -->
+  <div class="viewer-panel">
+    <div class="viewer-head" id="viewerHead">
+      <span class="viewer-title" style="color:#b0b0c8">Select a file</span>
+    </div>
+    <div class="sel-bar">
+      <span class="sel-info" id="selInfo">
+        <span class="kb">Select text then <kbd>⌘↵</kbd> to add &nbsp;·&nbsp;
+        <kbd>j</kbd><kbd>k</kbd> nav &nbsp;·&nbsp; <kbd>n</kbd> note &nbsp;·&nbsp; <kbd>d</kbd> del</span>
+      </span>
+      <button class="add-btn" id="addBtn" disabled onclick="addHandRule()">+ Add Rule</button>
+    </div>
+    <div class="viewer-body" id="viewerBody">
+      <div class="viewer-empty">← pick a file</div>
+    </div>
+  </div>
+
+  <!-- ── Rules panel ── -->
+  <div class="rules-panel">
+
+    <!-- annotator name -->
+    <div class="name-bar">
+      <label for="annotatorName">Annotator:</label>
+      <input id="annotatorName" class="name-input" placeholder="Your name"
+             oninput="saveName(this.value)">
+    </div>
+
+    <!-- bulk action bar -->
+    <div class="bulk-bar" id="bulkBar">
+      <span class="bulk-count" id="bulkCount">0 selected</span>
+      <button class="bulk-btn danger" onclick="bulkDelete()">Delete</button>
+      <button class="bulk-btn" onclick="bulkMerge()">Merge</button>
+      <button class="bulk-btn" onclick="clearRuleSelection()">Clear</button>
+    </div>
+
+    <!-- hand rules -->
+    <div class="rules-section hand-section">
+      <div class="section-head">
+        <span>Hand Rules</span>
+        <span class="section-count" id="handCount">0</span>
+        <button class="sel-all-btn" onclick="selectAll('hand')">select all</button>
+      </div>
+      <div class="rules-list" id="handRules">
+        <div class="empty-hint">Select text to add rules</div>
+      </div>
+    </div>
+
+    <!-- LLM extraction -->
+    <div class="rules-section llm-section">
+      <div class="section-head">
+        <span>LLM Extraction</span>
+        <span class="section-count" id="llmCount">0</span>
+        <button class="sel-all-btn" onclick="selectAll('llm')">select all</button>
+      </div>
+      <div class="llm-controls">
+        <div class="llm-row">
+          <select class="llm-model" id="llmModel">
+            <optgroup label="Perplexity">
+              <option value="sonar" selected>sonar</option>
+              <option value="sonar-pro">sonar-pro</option>
+              <option value="sonar-reasoning-pro">sonar-reasoning-pro</option>
+              <option value="sonar-deep-research">sonar-deep-research</option>
+            </optgroup>
+            <optgroup label="Anthropic (via Perplexity)">
+              <option value="anthropic/claude-haiku-4-5">claude-haiku-4-5</option>
+              <option value="anthropic/claude-sonnet-4-5">claude-sonnet-4-5</option>
+              <option value="anthropic/claude-sonnet-4-6">claude-sonnet-4-6</option>
+              <option value="anthropic/claude-opus-4-5">claude-opus-4-5</option>
+              <option value="anthropic/claude-opus-4-6">claude-opus-4-6</option>
+              <option value="anthropic/claude-opus-4-7">claude-opus-4-7</option>
+              <option value="anthropic/claude-opus-4-8">claude-opus-4-8</option>
+            </optgroup>
+            <optgroup label="OpenAI (via Perplexity)">
+              <option value="openai/gpt-5-mini">gpt-5-mini</option>
+              <option value="openai/gpt-5">gpt-5</option>
+              <option value="openai/gpt-5.1">gpt-5.1</option>
+              <option value="openai/gpt-5.2">gpt-5.2</option>
+              <option value="openai/gpt-5.4-nano">gpt-5.4-nano</option>
+              <option value="openai/gpt-5.4-mini">gpt-5.4-mini</option>
+              <option value="openai/gpt-5.4">gpt-5.4</option>
+              <option value="openai/gpt-5.5">gpt-5.5</option>
+            </optgroup>
+          </select>
+          <button class="run-btn" id="runBtn" onclick="runLLM()" disabled>Run</button>
+        </div>
+        <textarea class="llm-prompt" id="llmPrompt"
+          placeholder="Describe what to extract…">Extract all behavioral rules, constraints, and instructions from this file.</textarea>
+        <div class="llm-row" style="gap:5px">
+          <button class="icon-btn" onclick="savePrompt()">💾 Save</button>
+          <button class="icon-btn" id="historyBtn" onclick="toggleHistory()">🕑 History</button>
+          <button class="icon-btn" id="clearRunBtn" onclick="clearLastRun()" disabled style="margin-left:auto">Clear run</button>
+        </div>
+        <div class="prompt-history" id="promptHistory"></div>
+        <div class="llm-row">
+          <span class="llm-status" id="llmStatus"></span>
+        </div>
+      </div>
+      <div class="rules-list" id="llmRules">
+        <div class="empty-hint">Run the LLM to extract rules</div>
+      </div>
+    </div>
+
+    <div class="kb-bar">
+      <span><kbd>⌘↵</kbd> add</span>
+      <span><kbd>j</kbd><kbd>k</kbd> nav</span>
+      <span><kbd>n</kbd> note</span>
+      <span><kbd>d</kbd> del</span>
+      <span><kbd>x</kbd> select</span>
+      <span><kbd>↵</kbd> save note</span>
+      <span><kbd>Esc</kbd> cancel</span>
+    </div>
+  </div>
+</div>
+
+<script>
+// ─── State ───────────────────────────────────────────────────
+const S = {
+  allFiles:      [],
+  currentFile:   null,
+  rules:         [],
+  selection:     null,
+  focusedRuleId: null,
+  editingNoteId: null,
+  lastRunId:     null,
+  userName:      localStorage.getItem('annotatorName') || '',
+  selectedIds:   new Set(),
+  lastSelectedId: null,
+};
+
+// ─── Colour palette (per-extractor) ──────────────────────────
+// Each entry: bg, bdr (border), hov (hover bg), act (active bg), bg2 (tag bg)
+const COLORS = [
+  { bg:'rgba(245,158,11,.14)', bdr:'#f59e0b', hov:'rgba(245,158,11,.32)', act:'rgba(245,158,11,.50)', bg2:'rgba(245,158,11,.18)' },
+  { bg:'rgba(99,102,241,.12)', bdr:'#6366f1', hov:'rgba(99,102,241,.28)', act:'rgba(99,102,241,.44)', bg2:'rgba(99,102,241,.16)' },
+  { bg:'rgba(16,185,129,.12)', bdr:'#10b981', hov:'rgba(16,185,129,.28)', act:'rgba(16,185,129,.44)', bg2:'rgba(16,185,129,.16)' },
+  { bg:'rgba(239,68,68,.12)',  bdr:'#ef4444', hov:'rgba(239,68,68,.28)',  act:'rgba(239,68,68,.44)',  bg2:'rgba(239,68,68,.16)'  },
+  { bg:'rgba(236,72,153,.12)', bdr:'#ec4899', hov:'rgba(236,72,153,.28)', act:'rgba(236,72,153,.44)', bg2:'rgba(236,72,153,.16)' },
+  { bg:'rgba(14,165,233,.12)', bdr:'#0ea5e9', hov:'rgba(14,165,233,.28)', act:'rgba(14,165,233,.44)', bg2:'rgba(14,165,233,.16)' },
+  { bg:'rgba(168,85,247,.12)', bdr:'#a855f7', hov:'rgba(168,85,247,.28)', act:'rgba(168,85,247,.44)', bg2:'rgba(168,85,247,.16)' },
+  { bg:'rgba(251,146,60,.12)', bdr:'#fb923c', hov:'rgba(251,146,60,.28)', act:'rgba(251,146,60,.44)', bg2:'rgba(251,146,60,.16)' },
+];
+const _cc = {};
+function colorFor(name) {
+  if (!name) name = 'unknown';
+  if (_cc[name]) return _cc[name];
+  let h = 0;
+  for (const c of name) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  return (_cc[name] = COLORS[h % COLORS.length]);
+}
+function cssVars(col) {
+  return `--hl-bg:${col.bg};--hl-bdr:${col.bdr};--hl-hov:${col.hov};--hl-act:${col.act}`;
+}
+function rcVars(col) {
+  return `--rc-bdr:${col.bdr};--rc-bg:${col.bg};--rc-hov:${col.hov};--rc-act:${col.act};--rc-bg2:${col.bg2}`;
+}
+
+// ─── Boot ────────────────────────────────────────────────────
+async function init() {
+  document.getElementById('annotatorName').value = S.userName;
+  loadPromptHistory();
+  const files = await api('/api/files');
+  if (files.error) { setStatus(files.error,'error'); return; }
+  S.allFiles = files;
+  document.getElementById('fileCountLabel').textContent = files.length;
+  renderFileList(files);
+}
+
+// ─── Name ────────────────────────────────────────────────────
+function saveName(v) {
+  S.userName = v.trim();
+  localStorage.setItem('annotatorName', S.userName);
+}
+
+// ─── File list ───────────────────────────────────────────────
+function renderFileList(files) {
+  const el = document.getElementById('fileList');
+  if (!files.length) { el.innerHTML = '<div class="empty-hint">No files</div>'; return; }
+  // Get global index by id
+  const idxMap = {};
+  S.allFiles.forEach((f,i) => idxMap[f.id] = i+1);
+  el.innerHTML = files.map(f => {
+    const name = f.repo_name
+      ? f.repo_name.split('/').pop()
+      : (f.source_url||f.id).split('/').pop() || f.id;
+    const hCol = f.hand_count ? colorFor(S.userName || 'hand') : null;
+    const lCol = f.llm_count  ? colorFor(document.getElementById('llmModel').value) : null;
+    const badges = [
+      hCol ? `<span class="badge" style="background:${hCol.bg2};color:${hCol.bdr}">✎ ${f.hand_count}</span>` : '',
+      lCol ? `<span class="badge" style="background:${lCol.bg2};color:${lCol.bdr}">⚡ ${f.llm_count}</span>`  : '',
+    ].filter(Boolean).join('');
+    const active = S.currentFile?.id === f.id ? ' active' : '';
+    return `<div class="file-item${active}" id="fi-${f.id}" onclick="selectFile('${f.id}')">
+      <div class="file-idx">${idxMap[f.id]||'?'}</div>
+      <div class="file-info">
+        <div class="file-name" title="${esc(f.source_url||f.id)}">${esc(name)}</div>
+        <div class="file-meta">
+          <span>${esc(f.file_type||'—')}</span>
+          <span>${fmtSize(f.content_len)}</span>
+          ${badges}
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function filterFiles(q) {
+  q = q.toLowerCase();
+  renderFileList(q
+    ? S.allFiles.filter(f =>
+        (f.repo_name||'').toLowerCase().includes(q) ||
+        (f.source_url||'').toLowerCase().includes(q) ||
+        (f.file_type||'').toLowerCase().includes(q))
+    : S.allFiles);
+}
+
+// ─── Select file ─────────────────────────────────────────────
+async function selectFile(id) {
+  const [file, rules] = await Promise.all([
+    api(`/api/file/${id}`), api(`/api/rules/${id}`),
+  ]);
+  if (file.error) { setStatus(file.error,'error'); return; }
+  S.currentFile = file; S.rules = rules;
+  S.selection = null; S.focusedRuleId = null; S.editingNoteId = null; S.selectedIds.clear();
+  document.getElementById('runBtn').disabled = false;
+  document.getElementById('addBtn').disabled = true;
+  setSelInfo(null);
+  renderFileList(S.allFiles);
+  renderViewerHead(file);
+  renderViewer();
+  renderRulesPanel();
+}
+
+// ─── Viewer ──────────────────────────────────────────────────
+function renderViewerHead(file) {
+  const title = file.repo_name
+    ? `${file.repo_name}  /  ${(file.source_url||'').split('/').pop()}`
+    : (file.source_url||file.id).split('/').pop();
+  document.getElementById('viewerHead').innerHTML = `
+    <span class="viewer-title" title="${esc(file.source_url||'')}">${esc(title)}</span>
+    ${file.source_url ? `<a href="${esc(file.source_url)}" target="_blank">↗ source</a>` : ''}
+    <span style="font-size:11px;color:#aaa;flex-shrink:0">${fmtSize(file.content_len)}</span>
+  `;
+}
+
+function renderViewer() {
+  const body = document.getElementById('viewerBody');
+  if (!S.currentFile) {
+    body.innerHTML = '<div class="viewer-empty">← pick a file</div>'; return;
+  }
+  const content = S.currentFile.content;
+  const lineCount = (content.match(/\n/g)||[]).length + 1;
+  body.innerHTML = `
+    <div class="line-nums">${Array.from({length:lineCount},(_,i)=>i+1).join('\n')}</div>
+    <pre class="content-pre" id="contentPre"></pre>
+  `;
+  document.getElementById('contentPre').innerHTML =
+    renderLines(content, S.rules);
+  const pre = document.getElementById('contentPre');
+  pre.addEventListener('mouseup', onViewerMouseUp);
+  pre.addEventListener('mouseover', e => {
+    const el = e.target.closest?.('.line-hl[data-rids]');
+    if (el && el.dataset.rids.split(',').every(id => id !== S.focusedRuleId))
+      el.style.background = el.dataset.hov;
+  });
+  pre.addEventListener('mouseout', e => {
+    const el = e.target.closest?.('.line-hl[data-rids]');
+    if (el && el.dataset.rids.split(',').every(id => id !== S.focusedRuleId))
+      el.style.background = el.dataset.bg;
+  });
+}
+
+function renderLines(text, rules) {
+  const lines = text.split('\n');
+  // Build map: 0-based line index -> [{rule, col}]
+  const lineMap = new Map();
+  for (const r of rules) {
+    if (!r.line_start) continue;
+    const col = colorFor(r.extracted_by || (r.source === 'hand' ? S.userName : r.source) || '?');
+    const ls = r.line_start - 1;
+    const le = Math.min((r.line_end || r.line_start) - 1, lines.length - 1);
+    for (let i = ls; i <= le; i++) {
+      if (!lineMap.has(i)) lineMap.set(i, []);
+      lineMap.get(i).push({ r, col });
+    }
+  }
+  return lines.map((line, idx) => {
+    const entries = lineMap.get(idx);
+    if (!entries || !entries.length) return escHtml(line) + '\n';
+    const rids  = entries.map(e => e.r.id).join(',');
+    const { bg, hov, act } = entries[0].col;
+    const title = escAttr(entries.map(e => (e.r.extracted_by || '') + ': ' + e.r.rule_text.slice(0, 60)).join(' | '));
+    return `<span class="line-hl" data-rids="${rids}" data-bg="${bg}" data-hov="${hov}" data-act="${act}"` +
+      ` style="background:${bg}"` +
+      ` onclick="focusRule('${entries[0].r.id}')" title="${title}">${escHtml(line)}</span>\n`;
+  }).join('');
+}
+
+// ─── Text selection ──────────────────────────────────────────
+function onViewerMouseUp() {
+  const pre = document.getElementById('contentPre');
+  if (!pre) return;
+  const offsets = getSelectionOffsets(pre);
+  if (!offsets) { clearSelection(); return; }
+  S.selection = offsets;
+  const preview = offsets.text.slice(0,55).replace(/\s+/g,' ');
+  setSelInfo(`"${preview}${offsets.text.length>55?'…':''}" (${offsets.end-offsets.start} chars) — <kbd>⌘↵</kbd>`);
+  document.getElementById('addBtn').disabled = false;
+}
+
+function clearSelection() {
+  S.selection = null;
+  document.getElementById('addBtn').disabled = true;
+  setSelInfo(null);
+}
+
+function setSelInfo(html) {
+  const el = document.getElementById('selInfo');
+  el.innerHTML = html || `<span class="kb">Select text then <kbd>⌘↵</kbd> to add &nbsp;·&nbsp;
+    <kbd>j</kbd><kbd>k</kbd> nav &nbsp;·&nbsp; <kbd>n</kbd> note &nbsp;·&nbsp; <kbd>d</kbd> del</span>`;
+}
+
+// Robust offset using TreeWalker – handles marks/spans correctly
+function getSelectionOffsets(container) {
+  const sel = window.getSelection();
+  if (!sel || sel.isCollapsed || !sel.rangeCount) return null;
+  const range = sel.getRangeAt(0);
+  if (!container.contains(range.commonAncestorContainer)) return null;
+  const text = sel.toString();
+  if (!text.trim()) return null;
+
+  function walkOffset(targetNode, targetOff) {
+    let n = 0;
+    const w = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+    while (w.nextNode()) {
+      if (w.currentNode === targetNode) return n + targetOff;
+      n += w.currentNode.length;
+    }
+    return n + targetOff;
+  }
+
+  const start = walkOffset(range.startContainer, range.startOffset);
+  return { start, end: start + text.length, text };
+}
+
+async function addHandRule() {
+  if (!S.selection || !S.currentFile) return;
+  const { start, end, text } = S.selection;
+  const content = S.currentFile.content;
+  const line_start = content.slice(0, start).split('\n').length;
+  const line_end   = content.slice(0, end).split('\n').length;
+
+  const saved = await api('/api/rules', 'POST', {
+    file_id: S.currentFile.id, rule_text: text.trim(),
+    char_start: start, char_end: end, line_start, line_end,
+    extracted_by: S.userName || 'unknown',
+  });
+  if (saved.error) { setStatus(saved.error,'error'); return; }
+
+  S.rules.push(saved);
+  clearSelection();
+  window.getSelection()?.removeAllRanges();
+  renderViewer();
+  renderRulesPanel();
+  refreshFileBadge(S.currentFile.id);
+  setFocusedRule(saved.id);
+  setTimeout(() => openNoteEditor(saved.id), 60);
+}
+
+// ─── Rules panel ─────────────────────────────────────────────
+function renderRulesPanel() {
+  const hand = S.rules.filter(r => r.source === 'hand');
+  const llm  = S.rules.filter(r => r.source === 'llm');
+  document.getElementById('handCount').textContent = hand.length;
+  document.getElementById('llmCount').textContent  = llm.length;
+  document.getElementById('handRules').innerHTML = hand.length
+    ? hand.map(r => ruleCard(r)).join('')
+    : '<div class="empty-hint">Select text to add rules</div>';
+  document.getElementById('llmRules').innerHTML = llm.length
+    ? llm.map(r => ruleCard(r)).join('')
+    : '<div class="empty-hint">Run the LLM to extract rules</div>';
+  updateBulkBar();
+}
+
+function ruleCard(r) {
+  const extractor = r.extracted_by || (r.source==='hand' ? S.userName : r.source) || '?';
+  const col    = colorFor(extractor);
+  const hasPos = r.char_start != null || r.line_start != null;
+  const pos    = r.line_start ? `L${r.line_start}${r.line_end&&r.line_end!==r.line_start?'–'+r.line_end:''}` : 'no position';
+  const preview = r.rule_text.slice(0,110).replace(/\s+/g,' ');
+  const focused = S.focusedRuleId === r.id ? ' focused' : '';
+  const hasNote = r.notes ? ' has-note' : '';
+  const sel = S.selectedIds.has(r.id) ? ' selected' : '';
+  return `<div class="rule-card${focused}${sel}${hasPos?'':' no-pos'}" id="rc-${r.id}"
+               style="${rcVars(col)}" onclick="ruleCardClick(event,'${r.id}')">
+    <label class="rule-checkbox" onclick="event.stopPropagation()">
+      <input type="checkbox" ${S.selectedIds.has(r.id)?'checked':''} onchange="toggleRuleSelect('${r.id}',this.checked,event)">
+    </label>
+    <div class="rule-body">
+      <div><span class="extractor-tag" style="${rcVars(col)}">${esc(extractor)}</span></div>
+      <div class="rule-preview">${esc(preview)}${r.rule_text.length>110?'…':''}</div>
+      <div class="rule-pos">${pos}</div>
+      ${r.notes ? `<div class="rule-note-text">${esc(r.notes)}</div>` : ''}
+      <div class="rule-note-editor" id="rne-${r.id}">
+        <textarea class="rule-note-input" id="rni-${r.id}" rows="2"
+          placeholder="Add a note… (Enter save, Esc cancel)"
+          onkeydown="noteKeyDown(event,'${r.id}')"
+        >${esc(r.notes||'')}</textarea>
+        <div class="note-hint"><kbd>↵</kbd> save &nbsp; <kbd>Esc</kbd> cancel</div>
+      </div>
+    </div>
+    <div class="rule-actions">
+      <button class="rule-btn note-btn${hasNote}" onclick="toggleNote(event,'${r.id}')" title="Note (n)">✎</button>
+      <button class="rule-btn del" onclick="deleteRule(event,'${r.id}')" title="Delete (d)">×</button>
+    </div>
+  </div>`;
+}
+
+// ─── Focus / navigation ──────────────────────────────────────
+function setFocusedRule(id) {
+  // Restore previous focused line highlights
+  if (S.focusedRuleId) {
+    document.querySelectorAll(`.line-hl[data-rids]`).forEach(el => {
+      if (el.dataset.rids.split(',').includes(S.focusedRuleId))
+        el.style.background = el.dataset.bg;
+    });
+  }
+  S.focusedRuleId = id;
+  document.querySelectorAll('.rule-card').forEach(el => el.classList.remove('focused'));
+  if (id) {
+    const card = document.getElementById('rc-'+id);
+    card?.classList.add('focused');
+    card?.scrollIntoView({ behavior:'smooth', block:'nearest' });
+    document.querySelectorAll(`.line-hl[data-rids]`).forEach(el => {
+      if (el.dataset.rids.split(',').includes(id))
+        el.style.background = el.dataset.act;
+    });
+  }
+}
+
+function focusRule(id) {
+  setFocusedRule(id);
+  const first = [...document.querySelectorAll('.line-hl[data-rids]')]
+    .find(el => el.dataset.rids.split(',').includes(id));
+  if (first) first.scrollIntoView({ behavior:'smooth', block:'center' });
+}
+
+function allRuleCards() { return [...document.querySelectorAll('.rule-card')]; }
+
+function moveFocus(delta) {
+  const cards = allRuleCards();
+  if (!cards.length) return;
+  const idx  = cards.findIndex(c => c.id === 'rc-'+S.focusedRuleId);
+  const next = cards[Math.max(0, Math.min(cards.length-1, idx+delta))];
+  if (next) focusRule(next.id.replace('rc-',''));
+}
+
+// ─── Notes ───────────────────────────────────────────────────
+function toggleNote(evt, id) {
+  evt.stopPropagation();
+  S.editingNoteId === id ? closeNoteEditor(id, false) : openNoteEditor(id);
+}
+function openNoteEditor(id) {
+  if (S.editingNoteId && S.editingNoteId !== id) closeNoteEditor(S.editingNoteId, false);
+  setFocusedRule(id); S.editingNoteId = id;
+  const ed = document.getElementById('rne-'+id);
+  const inp = document.getElementById('rni-'+id);
+  if (!ed||!inp) return;
+  ed.classList.add('open'); inp.focus();
+  inp.setSelectionRange(inp.value.length, inp.value.length);
+}
+function closeNoteEditor(id, save) {
+  const ed = document.getElementById('rne-'+id);
+  const inp = document.getElementById('rni-'+id);
+  if (!ed) return;
+  if (save && inp) saveNote(id, inp.value);
+  ed.classList.remove('open'); S.editingNoteId = null;
+}
+async function saveNote(id, text) {
+  const notes = text.trim() || null;
+  await api(`/api/rules/${id}`, 'PATCH', { notes });
+  const rule = S.rules.find(r => r.id === id);
+  if (rule) rule.notes = notes;
+  const card = document.getElementById('rc-'+id);
+  if (card) {
+    const wasOpen = S.editingNoteId === id;
+    const prevFocused = S.focusedRuleId;
+    card.outerHTML = ruleCard(rule);
+    S.focusedRuleId = prevFocused;
+    document.getElementById('rc-'+id)?.classList.toggle('focused', prevFocused === id);
+    if (wasOpen) S.editingNoteId = null;
+  }
+}
+function noteKeyDown(evt, id) {
+  if (evt.key === 'Enter' && !evt.shiftKey) { evt.preventDefault(); closeNoteEditor(id, true); }
+  if (evt.key === 'Escape') { evt.preventDefault(); closeNoteEditor(id, false); }
+  evt.stopPropagation();
+}
+
+// ─── Bulk selection ──────────────────────────────────────────
+function ruleCardClick(evt, id) {
+  if (evt.shiftKey && S.lastSelectedId) {
+    rangeSelect(S.lastSelectedId, id);
+    return;
+  }
+  focusRule(id);
+  S.lastSelectedId = id;
+}
+
+function rangeSelect(fromId, toId) {
+  const ids = allRuleCards().map(c => c.id.replace('rc-', ''));
+  const a = ids.indexOf(fromId), b = ids.indexOf(toId);
+  if (a === -1 || b === -1) return;
+  const [lo, hi] = a < b ? [a, b] : [b, a];
+  ids.slice(lo, hi + 1).forEach(rid => S.selectedIds.add(rid));
+  S.lastSelectedId = toId;
+  renderRulesPanel();
+}
+
+function toggleRuleSelect(id, checked, evt) {
+  if (evt?.shiftKey && S.lastSelectedId && checked) {
+    rangeSelect(S.lastSelectedId, id);
+    return;
+  }
+  checked ? S.selectedIds.add(id) : S.selectedIds.delete(id);
+  document.getElementById('rc-'+id)?.classList.toggle('selected', checked);
+  if (checked) S.lastSelectedId = id;
+  updateBulkBar();
+}
+
+function selectAll(source) {
+  S.rules.filter(r => r.source === source).forEach(r => S.selectedIds.add(r.id));
+  renderRulesPanel();
+}
+
+function clearRuleSelection() {
+  S.selectedIds.clear();
+  renderRulesPanel();
+}
+
+function updateBulkBar() {
+  const n = S.selectedIds.size;
+  const bar = document.getElementById('bulkBar');
+  bar.classList.toggle('visible', n > 0);
+  document.getElementById('bulkCount').textContent = `${n} selected`;
+}
+
+async function bulkDelete() {
+  if (!S.selectedIds.size) return;
+  const ids = [...S.selectedIds];
+  for (const id of ids) await api(`/api/rules/${id}`, 'DELETE');
+  S.rules = S.rules.filter(r => !ids.includes(r.id));
+  if (ids.includes(S.focusedRuleId)) S.focusedRuleId = null;
+  S.selectedIds.clear();
+  renderViewer(); renderRulesPanel();
+  refreshFileBadge(S.currentFile?.id);
+}
+
+async function bulkMerge() {
+  if (S.selectedIds.size < 2) return;
+  const ids = [...S.selectedIds];
+  const selected = S.rules.filter(r => ids.includes(r.id))
+    .sort((a, b) => (a.line_start||0) - (b.line_start||0));
+  const line_start = Math.min(...selected.map(r => r.line_start || 0).filter(Boolean));
+  const line_end   = Math.max(...selected.map(r => r.line_end   || 0).filter(Boolean));
+  const rule_text  = selected.map(r => r.rule_text).join('\n');
+  const saved = await api('/api/rules', 'POST', {
+    file_id: S.currentFile.id, rule_text,
+    char_start: null, char_end: null,
+    line_start: line_start || null, line_end: line_end || null,
+    extracted_by: S.userName || 'merged',
+  });
+  if (saved.error) { alert(saved.error); return; }
+  for (const id of ids) await api(`/api/rules/${id}`, 'DELETE');
+  S.rules = S.rules.filter(r => !ids.includes(r.id));
+  S.rules.push(saved);
+  S.selectedIds.clear();
+  renderViewer(); renderRulesPanel();
+  refreshFileBadge(S.currentFile?.id);
+  setFocusedRule(saved.id);
+}
+
+// ─── Delete ──────────────────────────────────────────────────
+async function deleteRule(evt, id) {
+  evt.stopPropagation();
+  const cards = allRuleCards();
+  const idx   = cards.findIndex(c => c.id === 'rc-'+id);
+  const nextId = (cards[idx+1]||cards[idx-1])?.id.replace('rc-','') || null;
+  await api(`/api/rules/${id}`, 'DELETE');
+  S.rules = S.rules.filter(r => r.id !== id);
+  S.selectedIds.delete(id);
+  if (S.focusedRuleId === id) S.focusedRuleId = nextId;
+  if (S.editingNoteId === id) S.editingNoteId = null;
+  renderViewer(); renderRulesPanel();
+  if (nextId) setFocusedRule(nextId);
+  refreshFileBadge(S.currentFile?.id);
+}
+
+// ─── LLM ─────────────────────────────────────────────────────
+async function runLLM() {
+  if (!S.currentFile) return;
+  const prompt = document.getElementById('llmPrompt').value.trim();
+  const model  = document.getElementById('llmModel').value;
+  if (!prompt) { setStatus('Enter a prompt','error'); return; }
+  document.getElementById('runBtn').disabled = true;
+  setStatus('Running…');
+  const res = await api('/api/llm', 'POST', { file_id: S.currentFile.id, prompt, model });
+  document.getElementById('runBtn').disabled = false;
+  if (res.error) { setStatus(res.error,'error'); return; }
+  S.lastRunId = res.run_id;
+  document.getElementById('clearRunBtn').disabled = false;
+  const existing = new Set(S.rules.map(r => r.id));
+  for (const r of res.rules) if (!existing.has(r.id)) S.rules.push(r);
+  const matched = res.rules.filter(r => r.char_start!=null||r.line_start!=null).length;
+  setStatus(`${res.rules.length} rules, ${matched} located`, 'ok');
+  renderViewer(); renderRulesPanel();
+  refreshFileBadge(S.currentFile.id);
+}
+
+async function clearLastRun() {
+  if (!S.lastRunId) return;
+  await api(`/api/llm-runs/${S.lastRunId}`, 'DELETE');
+  S.rules = S.rules.filter(r => r.llm_run_id !== S.lastRunId);
+  S.lastRunId = null;
+  document.getElementById('clearRunBtn').disabled = true;
+  setStatus('Last run cleared');
+  renderViewer(); renderRulesPanel();
+  refreshFileBadge(S.currentFile?.id);
+}
+
+function setStatus(msg, cls='') {
+  const el = document.getElementById('llmStatus');
+  el.textContent = msg; el.className = 'llm-status'+(cls?' '+cls:'');
+}
+
+// ─── Prompt history ──────────────────────────────────────────
+function getPromptHistory() {
+  try { return JSON.parse(localStorage.getItem('promptHistory')||'[]'); }
+  catch { return []; }
+}
+
+async function savePrompt() {
+  const text = document.getElementById('llmPrompt').value.trim();
+  if (!text) return;
+  // Save to server
+  const res = await api('/api/prompts', 'POST', { prompt: text });
+  if (res.error) { setStatus(res.error,'error'); return; }
+  // Also cache locally
+  const history = getPromptHistory();
+  history.unshift({ id: res.id, text, saved_at: res.saved_at || new Date().toISOString() });
+  localStorage.setItem('promptHistory', JSON.stringify(history.slice(0,30)));
+  renderPromptHistoryPanel(history);
+  setStatus('Prompt saved','ok');
+}
+
+function toggleHistory() {
+  const el = document.getElementById('promptHistory');
+  el.classList.toggle('open');
+  if (el.classList.contains('open')) loadPromptHistory();
+}
+
+async function loadPromptHistory() {
+  // Try server first
+  const res = await api('/api/prompts');
+  if (Array.isArray(res)) {
+    const history = res.map(r => ({ id:r.id, text:r.prompt, label:r.label, saved_at:r.saved_at }));
+    localStorage.setItem('promptHistory', JSON.stringify(history));
+    renderPromptHistoryPanel(history);
+  } else {
+    renderPromptHistoryPanel(getPromptHistory());
+  }
+}
+
+function renderPromptHistoryPanel(history) {
+  const el = document.getElementById('promptHistory');
+  if (!history.length) {
+    el.innerHTML = '<div class="ph-item" style="color:#aaa">No saved prompts</div>';
+    return;
+  }
+  el.innerHTML = history.map(h => {
+    const d = h.saved_at ? new Date(h.saved_at).toLocaleDateString() : '';
+    const label = h.label ? `<span class="ph-label">${esc(h.label)}</span>` : '';
+    return `<div class="ph-item">
+      ${label}
+      <span class="ph-text" onclick="loadPrompt(${JSON.stringify(h.text)})"
+            title="${escAttr(h.text)}">${esc(h.text.slice(0,70))}${h.text.length>70?'…':''}</span>
+      <span class="ph-date">${d}</span>
+      <button class="ph-del" onclick="deletePrompt(event,'${h.id}')" title="Delete">×</button>
+    </div>`;
+  }).join('');
+}
+
+function loadPrompt(text) {
+  document.getElementById('llmPrompt').value = text;
+  document.getElementById('promptHistory').classList.remove('open');
+}
+
+async function deletePrompt(evt, id) {
+  evt.stopPropagation();
+  await api(`/api/prompts/${id}`, 'DELETE');
+  await loadPromptHistory();
+}
+
+// ─── Keyboard shortcuts ──────────────────────────────────────
+document.addEventListener('keydown', e => {
+  const tag = document.activeElement?.tagName?.toLowerCase();
+  const inText = tag==='textarea'||tag==='input';
+
+  // ⌘↵ – add rule (skip if in LLM prompt textarea)
+  if ((e.metaKey||e.ctrlKey) && e.key==='Enter') {
+    if (document.activeElement?.id === 'llmPrompt') return;
+    if (S.selection) { e.preventDefault(); addHandRule(); }
+    return;
+  }
+  if (inText) return;
+
+  switch (e.key) {
+    case 'j': case 'ArrowDown': e.preventDefault(); moveFocus(+1); break;
+    case 'k': case 'ArrowUp':   e.preventDefault(); moveFocus(-1); break;
+    case 'n':
+      e.preventDefault();
+      if (S.focusedRuleId) openNoteEditor(S.focusedRuleId);
+      break;
+    case 'd':
+      e.preventDefault();
+      if (S.focusedRuleId) deleteRule({ stopPropagation(){} }, S.focusedRuleId);
+      break;
+    case 'x':
+      e.preventDefault();
+      if (S.focusedRuleId) {
+        if (e.shiftKey && S.lastSelectedId) { rangeSelect(S.lastSelectedId, S.focusedRuleId); break; }
+        toggleRuleSelect(S.focusedRuleId, !S.selectedIds.has(S.focusedRuleId));
+      }
+      break;
+    case 'Escape':
+      if (S.editingNoteId) closeNoteEditor(S.editingNoteId, false);
+      else clearSelection();
+      break;
+  }
+});
+
+// Hover rule card → highlight mark
+const rulesPanel = document.querySelector('.rules-panel');
+rulesPanel.addEventListener('mouseover', e => {
+  const card = e.target.closest('.rule-card');
+  if (!card || card.id==='rc-'+S.focusedRuleId) return;
+  document.querySelector(`mark.hl[data-rid="${card.id.replace('rc-','')}"]`)?.classList.add('hover');
+});
+rulesPanel.addEventListener('mouseout', e => {
+  const card = e.target.closest('.rule-card');
+  if (!card) return;
+  document.querySelector(`mark.hl[data-rid="${card.id.replace('rc-','')}"]`)?.classList.remove('hover');
+});
+
+// ─── Helpers ─────────────────────────────────────────────────
+async function api(url, method='GET', body=null) {
+  try {
+    const opts = {method, headers:{}};
+    if (body) { opts.headers['Content-Type']='application/json'; opts.body=JSON.stringify(body); }
+    const r = await fetch(url, opts); return r.json();
+  } catch(e) { return {error:e.message}; }
+}
+function refreshFileBadge(id) {
+  if (!id) return;
+  const f = S.allFiles.find(f=>f.id===id);
+  if (f) {
+    f.hand_count = S.rules.filter(r=>r.source==='hand').length;
+    f.llm_count  = S.rules.filter(r=>r.source==='llm').length;
+  }
+  filterFiles(document.getElementById('fileSearch').value);
+}
+function esc(s) {
+  if (s==null) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+                  .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+function escHtml(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function escAttr(s) { return s.replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/</g,'&lt;'); }
+function fmtSize(n) { return n>1024?`${(n/1024).toFixed(1)}k`:`${n||'?'}b`; }
+
+init();
+</script>
+</body>
+</html>
+"""
+
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=5002)
+    args = parser.parse_args()
+    print(f"Rule Annotator → http://{args.host}:{args.port}")
+    app.run(debug=True, host=args.host, port=args.port, threaded=False)

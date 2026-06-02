@@ -356,6 +356,67 @@ async def scan_repo(session, repo_slug: str, token, con, stars: int = None,
 
 
 # ---------------------------------------------------------------------------
+# Public API: scrape a single GitHub repo URL for rules
+# ---------------------------------------------------------------------------
+
+def _parse_github_slug(url: str) -> str:
+    """Extract 'owner/repo' from a GitHub URL or bare slug."""
+    url = url.strip().rstrip("/")
+    m = re.search(r'github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)', url)
+    if m:
+        return m.group(1).rstrip(".git")
+    # Accept bare slugs like 'owner/repo'
+    if re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', url):
+        return url
+    raise ValueError(f"Cannot parse GitHub repo from: {url!r}")
+
+
+async def scrape_github_repo(
+    repo_url: str,
+    db_path: str = DB_PATH,
+    token: str = None,
+    source_label: str = "github_repo",
+) -> int:
+    """
+    Scrape a single GitHub repo URL for rule files and embedded system prompts.
+
+    Args:
+        repo_url:     Full GitHub URL (e.g. https://github.com/owner/repo)
+                      or bare slug (e.g. owner/repo).
+        db_path:      Path to the DuckDB database file.
+        token:        GitHub personal access token (falls back to GITHUB_TOKEN env var).
+        source_label: Value stored in the `source` column for scraped rules.
+
+    Returns:
+        Number of new rules saved to the database.
+    """
+    token = token or os.environ.get("GITHUB_TOKEN")
+    slug = _parse_github_slug(repo_url)
+
+    con = duckdb.connect(db_path)
+    init_db(con)
+
+    before = con.execute("SELECT COUNT(*) FROM rules").fetchone()[0]
+
+    async with aiohttp.ClientSession() as session:
+        await scan_repo(session, slug, token, con, source_label=source_label)
+
+    after = con.execute("SELECT COUNT(*) FROM rules").fetchone()[0]
+    con.close()
+    return after - before
+
+
+def scrape_repo(
+    repo_url: str,
+    db_path: str = DB_PATH,
+    token: str = None,
+    source_label: str = "github_repo",
+) -> int:
+    """Synchronous wrapper around scrape_github_repo."""
+    return asyncio.run(scrape_github_repo(repo_url, db_path, token, source_label))
+
+
+# ---------------------------------------------------------------------------
 # Source 1: Papers With Code
 # ---------------------------------------------------------------------------
 
@@ -702,5 +763,12 @@ if __name__ == "__main__":
                         help="Max repos to scan (0 = all); also caps embedded query results")
     parser.add_argument("--token", default=os.environ.get("GITHUB_TOKEN"),
                         help="GitHub personal access token")
+    parser.add_argument("--repo", default=None,
+                        help="Scrape a single GitHub repo URL (skips all other sources)")
     args = parser.parse_args()
-    asyncio.run(main(args.limit, args.token))
+
+    if args.repo:
+        saved = scrape_repo(args.repo, token=args.token)
+        print(f"Saved {saved} rules from {args.repo}  →  {DB_PATH}")
+    else:
+        asyncio.run(main(args.limit, args.token))
