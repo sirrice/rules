@@ -157,6 +157,34 @@ def _rule_row(r):
         "created_at": str(r[10]),
     }
 
+@app.route("/api/all-rules")
+def api_all_rules():
+    """All extracted rules joined with sample metadata for CSV export."""
+    acon = annot_con()
+    rows = acon.execute("""
+        SELECT r.id, r.file_id, r.rule_text, r.line_start, r.line_end,
+               r.source, r.extracted_by, r.notes, r.created_at
+        FROM extracted_rules r
+        ORDER BY r.file_id, COALESCE(r.line_start, 999999), r.created_at
+    """).fetchall()
+    acon.close()
+    # join source_url from sample.db
+    sc = sample_con()
+    url_map = {}
+    if rows:
+        fids = list({r[1] for r in rows})
+        placeholders = ",".join("?" * len(fids))
+        url_map = {r[0]: r[1] for r in sc.execute(
+            f"SELECT id, source_url FROM sample WHERE id IN ({placeholders})", fids
+        ).fetchall()}
+    sc.close()
+    return jsonify([{
+        "id": r[0], "file_id": r[1],
+        "source_url": url_map.get(r[1], ""),
+        "rule_text": r[2], "line_start": r[3], "line_end": r[4],
+        "source": r[5], "extracted_by": r[6], "notes": r[7], "created_at": str(r[8]),
+    } for r in rows])
+
 @app.route("/api/rules/<fid>")
 def api_rules(fid):
     con = annot_con()
@@ -329,6 +357,85 @@ def delete_llm_run(run_id):
     con.execute("DELETE FROM llm_runs WHERE id=?", [run_id])
     con.close()
     return jsonify({"ok": True})
+
+# ---------------------------------------------------------------------------
+# Routes – CSV export page
+# ---------------------------------------------------------------------------
+@app.route("/export")
+def export_page():
+    acon = annot_con()
+    rows = acon.execute("""
+        SELECT r.file_id, r.rule_text, r.line_start, r.line_end,
+               r.source, r.extracted_by, r.notes, r.created_at
+        FROM extracted_rules r
+        ORDER BY r.file_id, COALESCE(r.line_start, 999999), r.created_at
+    """).fetchall()
+    acon.close()
+    sc = sample_con()
+    url_map = {}
+    if rows:
+        fids = list({r[0] for r in rows})
+        placeholders = ",".join("?" * len(fids))
+        url_map = {r[0]: r[1] for r in sc.execute(
+            f"SELECT id, source_url FROM sample WHERE id IN ({placeholders})", fids
+        ).fetchall()}
+    sc.close()
+
+    import csv, io
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["source_url","source","extracted_by","line_start","line_end","rule_text","notes","created_at"])
+    for r in rows:
+        writer.writerow([url_map.get(r[0],""), r[4], r[5] or "", r[2] or "", r[3] or "",
+                         r[1], r[6] or "", str(r[7] or "")])
+    csv_text = buf.getvalue()
+    row_count = len(rows)
+
+    html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<title>Rules Export</title>
+<style>
+  body {{ font-family: system-ui, sans-serif; margin: 0; background: #f8f8fc; }}
+  .bar {{ display:flex; align-items:center; gap:12px; padding:12px 18px;
+          background:#fff; border-bottom:1px solid #e0e0ee; }}
+  .bar h2 {{ margin:0; font-size:15px; color:#333; flex:1; }}
+  .bar small {{ color:#888; font-size:12px; }}
+  button {{ padding:6px 16px; border-radius:20px; border:none; cursor:pointer;
+            font-size:13px; font-weight:600; }}
+  .dl  {{ background:#6366f1; color:#fff; }}
+  .dl:hover {{ background:#4f46e5; }}
+  .cp  {{ background:#f0f0f8; color:#4338ca; border:1px solid #c7d2fe; }}
+  .cp:hover {{ background:#eef2ff; }}
+  textarea {{ display:block; width:100%; height:calc(100vh - 60px);
+              border:none; padding:16px 18px; font-family:monospace;
+              font-size:12px; line-height:1.5; background:#f8f8fc;
+              color:#222; resize:none; box-sizing:border-box; outline:none; }}
+</style>
+</head><body>
+<div class="bar">
+  <h2>Rules Export</h2>
+  <small>{row_count} rule{"s" if row_count!=1 else ""}</small>
+  <button class="cp" onclick="copyCSV()">Copy</button>
+  <button class="dl" onclick="downloadCSV()">Download CSV</button>
+</div>
+<textarea id="csv" readonly>{csv_text.replace("&","&amp;").replace("<","&lt;")}</textarea>
+<script>
+const csv = document.getElementById('csv');
+function copyCSV() {{
+  csv.select(); document.execCommand('copy');
+  const b = document.querySelector('.cp');
+  b.textContent = 'Copied!';
+  setTimeout(() => b.textContent = 'Copy', 1500);
+}}
+function downloadCSV() {{
+  const a = document.createElement('a');
+  a.href = 'data:text/csv;charset=utf-8,' + encodeURIComponent(csv.value);
+  a.download = 'rules_export.csv'; a.click();
+}}
+csv.addEventListener('focus', () => csv.select());
+</script>
+</body></html>"""
+    return html
 
 # ---------------------------------------------------------------------------
 # Routes – saved prompts
@@ -1421,27 +1528,7 @@ rulesPanel.addEventListener('mouseout', e => {
 
 // ─── Export ──────────────────────────────────────────────────
 function exportCSV() {
-  if (!S.rules.length) return;
-  const cols = ['source_url', 'source', 'extracted_by', 'line_start', 'line_end', 'rule_text', 'notes'];
-  const csvCell = v => {
-    if (v == null) return '';
-    const s = String(v);
-    return (s.includes(',') || s.includes('"') || s.includes('\n')) ? `"${s.replace(/"/g,'""')}"` : s;
-  };
-  const rows = [cols.join(',')];
-  const url = S.currentFile?.source_url || '';
-  for (const r of S.rules) {
-    rows.push([url, r.source, r.extracted_by||'', r.line_start||'', r.line_end||'', r.rule_text, r.notes||'']
-      .map(csvCell).join(','));
-  }
-  const csv = rows.join('\n');
-  const blob = new Blob([csv], { type: 'text/csv' });
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  const fname = (url.split('/').pop() || S.currentFile?.id || 'rules').replace(/[^a-z0-9._-]/gi,'_');
-  a.download = fname + '_rules.csv';
-  a.click();
-  URL.revokeObjectURL(a.href);
+  window.open('/export', '_blank');
 }
 
 // ─── Helpers ─────────────────────────────────────────────────
