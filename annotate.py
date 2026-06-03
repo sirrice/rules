@@ -559,10 +559,12 @@ HTML = r"""<!DOCTYPE html>
 <title>Rule Annotator</title>
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root { --rules-panel-width: 420px; }
 body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   background: #f0f0f6; height: 100vh; overflow: hidden; color: #1a1a2e;
 }
+body.resizing { cursor: col-resize; user-select: none; }
 .layout { display: flex; height: 100vh; }
 
 /* ── File panel ── */
@@ -602,7 +604,7 @@ body {
 /* ── Viewer ── */
 .viewer-panel {
   flex: 1; display: flex; flex-direction: column; overflow: hidden;
-  background: #fff; border-right: 1px solid #e0e0ea;
+  background: #fff;
 }
 .viewer-head {
   padding: 9px 14px; background: #fafafa; border-bottom: 1px solid #eaeaf0;
@@ -654,9 +656,19 @@ kbd {
 }
 .line-hl:hover { filter: brightness(0.92); }
 
+.panel-resizer {
+  width: 8px; flex-shrink: 0; cursor: col-resize;
+  background: linear-gradient(to right, #e6e6f3 0, #f2f2fa 100%);
+  border-left: 1px solid #e0e0ea;
+  border-right: 1px solid #e0e0ea;
+}
+.panel-resizer:hover,
+.panel-resizer.active { background: linear-gradient(to right, #c7d2fe 0, #e0e7ff 100%); }
+
 /* ── Rules panel ── */
 .rules-panel {
-  width: 310px; flex-shrink: 0; display: flex; flex-direction: column;
+  width: var(--rules-panel-width); min-width: 280px; max-width: 760px;
+  flex-shrink: 0; display: flex; flex-direction: column;
   overflow: hidden; background: #fafafd;
 }
 
@@ -892,6 +904,8 @@ kbd {
     </div>
   </div>
 
+  <div class="panel-resizer" id="panelResizer" title="Drag to resize rules panel"></div>
+
   <!-- ── Rules panel ── -->
   <div class="rules-panel">
 
@@ -977,7 +991,7 @@ Return only a valid JSON array. Each element:
 {"rule_text": "<exact or near-exact quote>", "line_start": <int>, "line_end": <int>}</textarea>
           <div class="llm-row">
             <span class="llm-status" id="extractStatus"></span>
-            <button class="icon-btn" id="clearExtractBtn" onclick="clearExtraction()" disabled style="margin-left:auto">Clear</button>
+            <button class="icon-btn" id="clearExtractBtn" onclick="clearExtraction()" disabled style="margin-left:auto">Clear LLM</button>
           </div>
         </div>
         <div class="rules-list" id="llmRules">
@@ -1230,6 +1244,9 @@ const S = {
   selectedIds:   new Set(),
   lastSelectedId: null,
 };
+const RULES_PANEL_WIDTH_KEY = 'annotator.rulesPanelWidth';
+const RULES_PANEL_MIN = 280;
+const RULES_PANEL_MAX = 760;
 
 // ─── Colour palette (per-extractor) ──────────────────────────
 // Each entry: bg, bdr (border), hov (hover bg), act (active bg), bg2 (tag bg)
@@ -1258,9 +1275,60 @@ function rcVars(col) {
   return `--rc-bdr:${col.bdr};--rc-bg:${col.bg};--rc-hov:${col.hov};--rc-act:${col.act};--rc-bg2:${col.bg2}`;
 }
 
+function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, n)); }
+
+function maxRulesWidth() {
+  const layout = document.querySelector('.layout');
+  const filePanel = document.querySelector('.file-panel');
+  if (!layout || !filePanel) return RULES_PANEL_MAX;
+  const minViewerWidth = 340;
+  const resizerWidth = 8;
+  const available = Math.floor(layout.clientWidth - filePanel.clientWidth - minViewerWidth - resizerWidth);
+  return Math.max(RULES_PANEL_MIN, Math.min(RULES_PANEL_MAX, available));
+}
+
+function setRulesPanelWidth(px, save=true) {
+  const width = clamp(Math.round(px), RULES_PANEL_MIN, maxRulesWidth());
+  document.documentElement.style.setProperty('--rules-panel-width', `${width}px`);
+  if (save) localStorage.setItem(RULES_PANEL_WIDTH_KEY, String(width));
+}
+
+function initResizableRulesPanel() {
+  const saved = parseInt(localStorage.getItem(RULES_PANEL_WIDTH_KEY) || '', 10);
+  if (!Number.isNaN(saved)) setRulesPanelWidth(saved, false);
+  else setRulesPanelWidth(420, false);
+
+  const resizer = document.getElementById('panelResizer');
+  const layout = document.querySelector('.layout');
+  if (!resizer || !layout) return;
+
+  function onMove(e) {
+    const rect = layout.getBoundingClientRect();
+    setRulesPanelWidth(rect.right - e.clientX);
+  }
+  function stopResize() {
+    document.body.classList.remove('resizing');
+    resizer.classList.remove('active');
+    window.removeEventListener('mousemove', onMove);
+    window.removeEventListener('mouseup', stopResize);
+  }
+  resizer.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    document.body.classList.add('resizing');
+    resizer.classList.add('active');
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', stopResize);
+  });
+  window.addEventListener('resize', () => {
+    const current = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--rules-panel-width') || '', 10);
+    if (!Number.isNaN(current)) setRulesPanelWidth(current, false);
+  });
+}
+
 // ─── Boot ────────────────────────────────────────────────────
 async function init() {
   document.getElementById('annotatorName').value = S.userName;
+  initResizableRulesPanel();
   updateRunBtn();
   loadPromptHistory();
   const files = await api('/api/files');
@@ -1326,6 +1394,7 @@ async function selectFile(id) {
   if (file.error) { setStatus(file.error,'error'); return; }
   S.currentFile = file; S.rules = rules;
   S.selection = null; S.focusedRuleId = null; S.editingNoteId = null; S.selectedIds.clear();
+  S.lastExtractRunId = null;
   document.getElementById('runBtn').disabled = false;
   document.getElementById('extractBtn').disabled = false;
   document.getElementById('addBtn').disabled = true;
@@ -1511,6 +1580,38 @@ function renderRulesPanel() {
     ? llm.map(r => ruleCard(r)).join('')
     : '<div class="empty-hint">Run the LLM to extract rules</div>';
   updateBulkBar();
+  updateExtractClearButton();
+}
+
+function selectedLlmIds() {
+  const selected = new Set(S.selectedIds);
+  return S.rules
+    .filter(r => r.source === 'llm' && selected.has(r.id))
+    .map(r => r.id);
+}
+
+function focusedLlmId() {
+  const focused = S.rules.find(r => r.id === S.focusedRuleId);
+  return focused?.source === 'llm' ? focused.id : null;
+}
+
+function updateExtractClearButton() {
+  const btn = document.getElementById('clearExtractBtn');
+  if (!btn) return;
+  const selected = selectedLlmIds();
+  if (selected.length) {
+    btn.disabled = false;
+    btn.textContent = `Clear selected (${selected.length})`;
+    return;
+  }
+  const focusedId = focusedLlmId();
+  if (focusedId) {
+    btn.disabled = false;
+    btn.textContent = 'Clear focused';
+    return;
+  }
+  btn.disabled = !S.lastExtractRunId;
+  btn.textContent = 'Clear last run';
 }
 
 function ruleCard(r) {
@@ -1567,6 +1668,7 @@ function setFocusedRule(id) {
         el.style.background = el.dataset.act;
     });
   }
+  updateExtractClearButton();
 }
 
 function focusRule(id) {
@@ -1674,6 +1776,7 @@ function updateBulkBar() {
   const bar = document.getElementById('bulkBar');
   bar.classList.toggle('visible', n > 0);
   document.getElementById('bulkCount').textContent = `${n} selected`;
+  updateExtractClearButton();
 }
 
 async function bulkDelete() {
@@ -1755,7 +1858,6 @@ async function runExtraction() {
   console.log('  with line_start:', rules.filter(r => r.line_start != null).length);
   console.log('  sample:', rules.slice(0,3).map(r => ({id:r.id, line_start:r.line_start, text:r.rule_text?.slice(0,40)})));
   S.lastExtractRunId = res.run_id;
-  document.getElementById('clearExtractBtn').disabled = false;
   const existing = new Set(S.rules.map(r => r.id));
   for (const r of rules) if (!existing.has(r.id)) S.rules.push(r);
   const matched = rules.filter(r => r.line_start != null).length;
@@ -1765,12 +1867,33 @@ async function runExtraction() {
 }
 
 async function clearExtraction() {
+  const selected = selectedLlmIds();
+  if (selected.length) {
+    for (const id of selected) await api(`/api/rules/${id}`, 'DELETE');
+    S.rules = S.rules.filter(r => !(r.source === 'llm' && selected.includes(r.id)));
+    selected.forEach(id => S.selectedIds.delete(id));
+    if (selected.includes(S.focusedRuleId)) S.focusedRuleId = null;
+    setExtractStatus(`Cleared ${selected.length} selected rule${selected.length===1?'':'s'}`, 'ok');
+    renderViewer(); renderRulesPanel();
+    refreshFileBadge(S.currentFile?.id);
+    return;
+  }
+  const focusedId = focusedLlmId();
+  if (focusedId) {
+    await api(`/api/rules/${focusedId}`, 'DELETE');
+    S.rules = S.rules.filter(r => r.id !== focusedId);
+    S.selectedIds.delete(focusedId);
+    if (S.focusedRuleId === focusedId) S.focusedRuleId = null;
+    setExtractStatus('Cleared focused rule', 'ok');
+    renderViewer(); renderRulesPanel();
+    refreshFileBadge(S.currentFile?.id);
+    return;
+  }
   if (!S.lastExtractRunId) return;
   await api(`/api/llm-runs/${S.lastExtractRunId}`, 'DELETE');
   S.rules = S.rules.filter(r => r.llm_run_id !== S.lastExtractRunId);
   S.lastExtractRunId = null;
-  document.getElementById('clearExtractBtn').disabled = true;
-  setExtractStatus('Cleared');
+  setExtractStatus('Cleared last run', 'ok');
   renderViewer(); renderRulesPanel();
   refreshFileBadge(S.currentFile?.id);
 }
